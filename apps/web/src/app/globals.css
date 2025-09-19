@@ -1,0 +1,55 @@
+/* Tailwind v3 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------- Global Aesthetic ---------- */
+:root {
+  --bg-1: #0b0f19;      /* deep slate */
+  --bg-2: #0e1424;      /* blue-black */
+  --ring:  72 187 255;  /* sky-300 */
+  --muted: 148 163 184; /* slate-400 */
+}
+
+/* Full-bleed dark gradient with soft vignette + hint of grain */
+html, body {
+  height: 100%;
+}
+body {
+  background:
+    radial-gradient(1400px 800px at 80% -10%, rgba(59,130,246,0.12), rgba(59,130,246,0) 60%),
+    radial-gradient(1000px 700px at -10% 50%, rgba(20,184,166,0.10), rgba(20,184,166,0) 60%),
+    linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
+  color: rgb(226 232 240); /* slate-200 */
+}
+
+/* Subtle vignette */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(1200px 600px at 50% -100px, rgba(255,255,255,0.07), transparent 70%);
+  mix-blend-mode: overlay;
+}
+
+/* Micro grain using background blend, very subtle */
+body::after {
+  content: "";
+  position: fixed; inset: 0; pointer-events: none;
+  background-image:
+    radial-gradient(1px 1px at 25% 20%, rgba(255,255,255,0.06) 1px, transparent 1px),
+    radial-gradient(1px 1px at 75% 80%, rgba(255,255,255,0.05) 1px, transparent 1px);
+  background-size: 6px 6px, 7px 7px;
+  opacity: .35;
+}
+
+/* Scrollbar polish inside chat */
+.chat-scroll::-webkit-scrollbar { width: 10px; }
+.chat-scroll::-webkit-scrollbar-track { background: transparent; }
+.chat-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(148,163,184,.35);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}

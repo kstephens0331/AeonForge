@@ -1,0 +1,11 @@
+{
+  "name": "aeonforge",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:web": "pnpm --filter @aeonforge/web dev",
+    "dev:server": "pnpm --filter @aeonforge/server dev",
+    "dev": "echo \"Open two terminals: pnpm dev:server and pnpm dev:web\"",
+    "build": "pnpm -r build"
+  }
+}
