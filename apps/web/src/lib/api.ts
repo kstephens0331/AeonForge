@@ -1,15 +1,28 @@
-export async function apiFetch<T>(path: string, token: string, init?: RequestInit) {
+export async function apiFetch<T>(
+  path: string,
+  accessToken: string,
+  init?: RequestInit & { signal?: AbortSignal }
+): Promise<T> {
   const res = await fetch(`http://localhost:8787${path}`, {
-    ...init,
+    method: "GET",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      ...(init?.headers || {})
-    }
+      Authorization: `Bearer ${accessToken}`,
+    },
+    ...init,
   });
+
+  // If aborted, surface a friendly error
+  if (res.body === null && (init?.signal?.aborted ?? false)) {
+    throw new Error("Request aborted");
+  }
+
   if (!res.ok) {
-    let msg = "Request failed";
-    try { const j = await res.json(); msg = j?.error || msg; } catch {}
+    let msg = `HTTP ${res.status}`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = data.error;
+    } catch {}
     throw new Error(msg);
   }
   return (await res.json()) as T;

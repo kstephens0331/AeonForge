@@ -1,13 +1,51 @@
 ﻿"use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { apiFetch } from "@/lib/api";
-import StatusPill from "../components/StatusPill";
 
 type Role = "user" | "assistant" | "system";
 type ChatMessage = { role: Role; content: string; created_at?: string; id?: string };
 type Conversation = { id: string; title: string | null; created_at: string };
+
+/** Inline Status Pill (no import) */
+function StatusPillInline() {
+  const [status, setStatus] = useState<"checking" | "online" | "offline">("checking");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function ping() {
+      try {
+        const res = await fetch("http://localhost:8787/healthz", { cache: "no-store" });
+        if (!cancelled) setStatus(res.ok ? "online" : "offline");
+      } catch {
+        if (!cancelled) setStatus("offline");
+      }
+    }
+    ping();
+    const id = setInterval(ping, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const color =
+    status === "online" ? "bg-emerald-400" :
+    status === "offline" ? "bg-rose-400" : "bg-slate-400";
+
+  const label =
+    status === "online" ? "API online" :
+    status === "offline" ? "API offline" : "Checking…";
+
+  return (
+    <div className="fixed left-3 bottom-3 z-50 flex items-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 backdrop-blur-xl">
+      <span className={`inline-block h-2 w-2 rounded-full ${color}`} />
+      <span>{label}</span>
+    </div>
+  );
+}
 
 export default function HomePage() {
   const [email, setEmail] = useState<string | null>(null);
@@ -17,6 +55,7 @@ export default function HomePage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [aborter, setAborter] = useState<AbortController | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -31,24 +70,22 @@ export default function HomePage() {
       setEmail(s?.user?.email ?? null);
       setToken(s?.access_token ?? null);
     });
-    return () => { sub.subscription.unsubscribe(); };
+    return () => sub.subscription.unsubscribe();
   }, []);
 
-  // hydrate conversationId from localStorage
+  // hydrate conversationId
   useEffect(() => {
     const cid = localStorage.getItem("af_conversation_id");
     if (cid) setConversationId(cid);
   }, []);
 
-  // when we have token + conversationId, load messages. If no conversationId, create one.
+  // load existing messages
   useEffect(() => {
     if (!token) return;
-
     (async () => {
       try {
         let cid = conversationId;
         if (!cid) {
-          // Make a new conversation with a simple title
           const res = await apiFetch<{ conversation: Conversation }>(
             "/conversations",
             token,
@@ -58,14 +95,11 @@ export default function HomePage() {
           setConversationId(cid);
           localStorage.setItem("af_conversation_id", cid);
         }
-
-        // Load existing messages
         const list = await apiFetch<{ messages: ChatMessage[] }>(
           `/conversations/${cid}/messages`,
           token
         );
         setMessages(list.messages);
-        // scroll down
         setTimeout(() => {
           scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
         }, 0);
@@ -76,7 +110,7 @@ export default function HomePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
-  // textarea autosize up to 6 lines
+  // autosize textarea (max 6 lines)
   const autoSize = () => {
     const el = textareaRef.current;
     if (!el) return;
@@ -91,39 +125,89 @@ export default function HomePage() {
 
   async function sendMessage() {
     const text = input.trim();
-    if (!text || !token) return;
+    if (!text || !token || loading) return;
 
+    // Optimistically add user message and a placeholder AI message
+    setMessages((prev) => [...prev, { role: "user", content: text }, { role: "assistant", content: "" }]);
+    setInput("");
+    requestAnimationFrame(() => autoSize());
     setLoading(true);
-    try {
-      const res = await apiFetch<{ conversationId: string; text: string }>(
-        "/chat",
-        token,
-        { method: "POST", body: JSON.stringify({ conversationId, text }) }
-      );
 
-      // persist cid in case it was created server-side
-      if (!conversationId) {
-        setConversationId(res.conversationId);
-        localStorage.setItem("af_conversation_id", res.conversationId);
+    const controller = new AbortController();
+    setAborter(controller);
+
+    try {
+      const res = await fetch("http://localhost:8787/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ conversationId, text }),
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+      // (Optional) If you later send X-Conversation-Id from server, pick it up here
+      const newCid = res.headers.get("X-Conversation-Id");
+      if (newCid && !conversationId) {
+        setConversationId(newCid);
+        localStorage.setItem("af_conversation_id", newCid);
       }
 
-      // Optimistic UI: add user msg + server echo (assistant)
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content: text },
-        { role: "assistant", content: res.text }
-      ]);
-      setInput("");
-      requestAnimationFrame(() => autoSize());
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
 
-      // Scroll down
-      setTimeout(() => {
-        scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-      }, 30);
-    } catch (e) {
-      console.error(e);
+      while (!done) {
+        const { value, done: d } = await reader.read();
+        done = d;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          // append chunk to the last assistant message
+          setMessages((prev) => {
+            const copy = [...prev];
+            const last = copy[copy.length - 1];
+            if (last && last.role === "assistant") {
+              last.content += chunk;
+            }
+            return copy;
+          });
+          // auto-scroll as we stream
+          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+        }
+      }
+    } catch (e: any) {
+      if (e?.name !== "AbortError" && e?.message !== "Request aborted") {
+        console.error(e);
+        // show a minimal error in the last assistant bubble if empty
+        setMessages((prev) => {
+          const copy = [...prev];
+          const last = copy[copy.length - 1];
+          if (last && last.role === "assistant" && !last.content) {
+            last.content = "…request failed.";
+          }
+          return copy;
+        });
+      }
     } finally {
       setLoading(false);
+      setAborter(null);
+      // final scroll
+      setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }), 16);
+    }
+  }
+
+  function stopRequest() {
+    if (aborter) {
+      aborter.abort();
+      setAborter(null);
+      setLoading(false);
+    }
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      if (loading) { e.preventDefault(); return; } // cannot send while streaming
+      e.preventDefault();
+      void sendMessage();
     }
   }
 
@@ -133,29 +217,23 @@ export default function HomePage() {
         <div className="text-center space-y-4">
           <h1 className="text-2xl font-semibold">AeonForge</h1>
           <p className="text-slate-300">Please sign in to continue.</p>
-          <a
-            href="/(auth)/login"
+          <Link
+            href="/login"
             className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition"
           >
             Sign in
-          </a>
+          </Link>
         </div>
       </main>
     );
   }
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void sendMessage();
-    }
-  }
-
   return (
     <main className="h-screen w-screen">
-      <StatusPill />
+      <StatusPillInline />
       <div className="h-full w-full px-4 md:px-6 lg:px-10 py-6">
         <div className="mx-auto h-full max-w-6xl rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-[0_20px_120px_rgba(0,0,0,.35)] overflow-hidden">
+          {/* Header */}
           <div className="flex items-center justify-between border-b border-white/10 bg-white/5 px-5 sm:px-8 py-4">
             <div className="flex items-center gap-3">
               <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-sky-400 to-teal-300 shadow-[0_6px_20px_rgba(56,189,248,.35)]" />
@@ -164,25 +242,50 @@ export default function HomePage() {
                 <p className="text-[11px] sm:text-xs text-slate-300/80">{email}</p>
               </div>
             </div>
-            <button
-              onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
-              className="text-xs text-slate-300/80 hover:text-white"
-            >
-              Sign out
-            </button>
+
+            <div className="flex items-center gap-3">
+              {loading && (
+                <div className="flex items-center gap-2">
+                  <div className="hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100">
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-300 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-300"></span>
+                    </span>
+                    <span>AeonForge is thinking…</span>
+                  </div>
+                  <button
+                    onClick={stopRequest}
+                    className="rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20 transition"
+                    aria-label="Stop generating"
+                    title="Stop"
+                  >
+                    Stop
+                  </button>
+                </div>
+              )}
+              <button
+                onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
+                className="text-xs text-slate-300/80 hover:text-white"
+              >
+                Sign out
+              </button>
+            </div>
           </div>
 
+          {/* Chat area */}
           <div className="flex h-[calc(100%-3.5rem)] flex-col">
             <div ref={scrollRef} className="chat-scroll flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-5 space-y-4">
               {messages.map((m, i) => {
                 const isUser = m.role === "user";
                 return (
-                  <div key={i}
+                  <div
+                    key={i}
                     className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
                       isUser
                         ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
                         : "mr-auto text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,.25)] border border-white/10 bg-white/8"
-                    }`}>
+                    }`}
+                  >
                     <div className={`mb-1 text-[11px] ${isUser ? "text-slate-300" : "text-sky-300"}`}>
                       {isUser ? "You" : "AeonForge"}
                     </div>
@@ -190,14 +293,9 @@ export default function HomePage() {
                   </div>
                 );
               })}
-              {loading && (
-                <div className="mr-auto max-w-[70%] px-4 py-3 rounded-2xl text-slate-100 border border-white/10 bg-white/8 shadow-[0_10px_30px_rgba(2,6,23,.25)]">
-                  <div className="mb-1 text-[11px] text-sky-300">AeonForge</div>
-                  Thinking…
-                </div>
-              )}
             </div>
 
+            {/* Composer */}
             <div className="border-t border-white/10 bg-white/5 px-4 sm:px-6 lg:px-8 py-4">
               <div className="ml-auto flex w-full sm:w-[80%] md:w-[70%] lg:w-[60%] gap-2">
                 <textarea
@@ -211,7 +309,8 @@ export default function HomePage() {
                 />
                 <button
                   className="px-4 py-2.5 rounded-2xl text-slate-900 bg-sky-300 hover:bg-sky-200 active:bg-sky-300 transition shadow-[0_10px_30px_rgba(56,189,248,.35)] disabled:opacity-60"
-                  disabled={loading || !input.trim()}
+                  disabled={loading || !input.trim()} // typing allowed; send blocked during streaming
+                  aria-busy={loading}
                   onClick={() => void sendMessage()}
                 >
                   Send
