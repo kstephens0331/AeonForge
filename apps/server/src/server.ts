@@ -3,13 +3,15 @@ import cors from "@fastify/cors";
 import { verifySupabaseJwt } from "./auth";
 import { admin } from "./db";
 import type { ConversationRow, MessageRow, Role } from "./types";
+import { routeGenerate, routeGenerateStream } from "./router";
+import { retrieveContext } from "./ragSearch";
 
 const fastify = Fastify({ logger: true });
 
 fastify.register(cors, {
   origin: "http://localhost:3000",
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"]
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 });
 
 fastify.get("/healthz", async () => ({ ok: true }));
@@ -33,7 +35,6 @@ fastify.addHook("preHandler", async (req, reply) => {
 
 // -------- Conversations --------
 
-// Create a conversation (optional: with initial title)
 fastify.post<{ Body: { title?: string | null } }>("/conversations", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { title = null } = req.body ?? {};
@@ -46,7 +47,6 @@ fastify.post<{ Body: { title?: string | null } }>("/conversations", async (req, 
   return { conversation: data as ConversationRow };
 });
 
-// List conversations for current user (latest first)
 fastify.get("/conversations", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { data, error } = await admin
@@ -60,12 +60,10 @@ fastify.get("/conversations", async (req, reply) => {
 
 // -------- Messages --------
 
-// Get messages in a conversation (chronological)
 fastify.get<{ Params: { id: string } }>("/conversations/:id/messages", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const convoId = req.params.id;
 
-  // Ensure user owns the conversation (cheap check)
   const { data: convo, error: convoErr } = await admin
     .from("conversations")
     .select("id,user_id")
@@ -84,7 +82,6 @@ fastify.get<{ Params: { id: string } }>("/conversations/:id/messages", async (re
   return { messages: (data ?? []) as MessageRow[] };
 });
 
-// Append a message (user or assistant)
 fastify.post<{
   Params: { id: string };
   Body: { role: Role; content: string };
@@ -93,7 +90,6 @@ fastify.post<{
   const convoId = req.params.id;
   const { role, content } = req.body;
 
-  // Ownership check
   const { data: convo, error: convoErr } = await admin
     .from("conversations")
     .select("id,user_id")
@@ -112,49 +108,210 @@ fastify.post<{
   return { message: data as MessageRow };
 });
 
-// -------- Chat (echo + persistence) --------
+// -------- RAG Ingest (from earlier) --------
+fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+  const { text, filename } = req.body ?? {};
+  if (!text || typeof text !== "string" || text.trim().length < 10) {
+    return reply.code(400).send({ error: "Provide 'text' with at least 10 characters." });
+  }
+  const fname = filename && filename.trim() ? filename.trim() : `text-${new Date().toISOString()}.txt`;
+  const { data: doc, error: docErr } = await admin
+    .from("documents")
+    .insert({
+      user_id: userId,
+      filename: fname,
+      mime_type: "text/plain",
+      byte_size: text.length,
+    })
+    .select()
+    .single();
+  if (docErr || !doc) {
+    return reply.code(500).send({ error: docErr?.message ?? "Failed to create document" });
+  }
 
-// Accepts { conversationId?, text }.
-// If conversationId missing, creates one. Stores user msg then assistant reply.
+  function chunkText(s: string, target = 700): string[] {
+    const paragraphs = s.replace(/\r\n/g, "\n").trim().split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+    const out: string[] = [];
+    let buf = "";
+    const flush = () => { const b = buf.trim(); if (b) out.push(b); buf = ""; };
+    const push = (piece: string) => {
+      if ((buf + " " + piece).trim().length > target) { flush(); buf = piece; } else { buf = (buf ? buf + " " : "") + piece; }
+    };
+    for (const p of paragraphs) {
+      if (p.length <= target) { push(p); continue; }
+      for (const snt of p.split(/(?<=[\.\!\?])\s+/)) {
+        if (snt.length <= target) { push(snt); }
+        else {
+          let cur = "";
+          for (const w of snt.split(/\s+/)) {
+            if ((cur + " " + w).trim().length > target) { push(cur); cur = w; } else { cur = (cur ? cur + " " : "") + w; }
+          }
+          if (cur) push(cur);
+        }
+      }
+    }
+    flush();
+    return out;
+  }
+
+  const pieces = chunkText(text);
+  if (pieces.length === 0) return reply.code(400).send({ error: "No chunks produced from provided text." });
+
+  let embeddings: number[][] | null = null;
+  try {
+    if (process.env.TOGETHER_API_KEY) {
+      const { togetherEmbed } = await import("./models/together.js");
+      embeddings = await togetherEmbed(pieces);
+    }
+  } catch (e: any) {
+    fastify.log.warn({ msg: "embed_failed", error: e?.message });
+    embeddings = null;
+  }
+
+  const rows = pieces.map((content, idx) => ({
+    document_id: doc.id, user_id: (req as any).user?.sub as string, chunk_index: idx, content,
+    embedding: embeddings ? embeddings[idx] : null
+  }));
+  const { error: chErr } = await admin.from("doc_chunks").insert(rows);
+  if (chErr) return reply.code(500).send({ error: chErr.message });
+
+  return { documentId: doc.id, filename: doc.filename, chunks: pieces.length, embedded: Boolean(embeddings) };
+});
+
+// -------- Non-streaming Chat (kept for compatibility; hides provider/model) --------
 fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { conversationId, text } = req.body;
+  const q = text?.trim() ?? "";
 
-  // 1) Ensure conversation
+  // Ensure conversation
   let convId = conversationId ?? null;
   if (!convId) {
     const { data: newConv, error: convErr } = await admin
       .from("conversations")
-      .insert({ user_id: userId, title: text.slice(0, 60) })
+      .insert({ user_id: userId, title: q.slice(0, 60) })
       .select()
       .single();
     if (convErr || !newConv) return reply.code(500).send({ error: convErr?.message ?? "conv create failed" });
     convId = newConv.id;
   } else {
-    // quick ownership check
-    const { data: c, error: ce } = await admin
-      .from("conversations")
-      .select("id,user_id")
-      .eq("id", convId)
-      .single();
+    const { data: c, error: ce } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
     if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
   }
 
-  // 2) Insert user message
-  const { error: uErr } = await admin
-    .from("messages")
-    .insert({ conversation_id: convId, role: "user", content: text });
-  if (uErr) return reply.code(500).send({ error: uErr.message });
+  // Insert user message
+  await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
 
-  // 3) Produce assistant message (echo for now)
-  const assistant = `Echo: ${text}`;
+  // RAG context
+  const context = await retrieveContext(userId, q);
+  const system = context
+    ? `You are AeonForge. Use the CONTEXT below if relevant.\n\nCONTEXT:\n${context}\n\nIf not relevant, ignore.`
+    : `You are AeonForge. Answer clearly and concisely.`;
 
-  const { error: aErr } = await admin
-    .from("messages")
-    .insert({ conversation_id: convId, role: "assistant", content: assistant });
-  if (aErr) return reply.code(500).send({ error: aErr.message });
+  // Generate
+  const r = await routeGenerate(system, q);
+  const resultText = r.text;
 
-  return { conversationId: convId, text: assistant };
+  // Store assistant message
+  await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: resultText });
+
+  // Log
+  void admin.from("request_logs").insert({
+    user_id: userId, model: `${r.provider}:${r.model}`, tokens_in: r.tokens_in ?? null,
+    tokens_out: r.tokens_out ?? null, latency_ms: r.latency_ms, success: r.success,
+  });
+
+  return { conversationId: convId, text: resultText };
+});
+
+// -------- Streaming Chat (new) --------
+fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/stream", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+  const { conversationId, text } = req.body ?? {};
+  const q = (text ?? "").trim();
+  if (!q) {
+    reply.code(400);
+    return { error: "Missing 'text'." };
+  }
+
+  // Ensure conversation
+  let convId = conversationId ?? null;
+  if (!convId) {
+    const { data: newConv, error: convErr } = await admin
+      .from("conversations")
+      .insert({ user_id: userId, title: q.slice(0, 60) })
+      .select()
+      .single();
+    if (convErr || !newConv) return reply.code(500).send({ error: convErr?.message ?? "conv create failed" });
+    convId = newConv.id;
+  } else {
+    const { data: c, error: ce } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
+    if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
+  }
+
+  // Insert user message
+  await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
+
+  // Compose system with RAG
+  const context = await retrieveContext(userId, q);
+  const system = context
+    ? `You are AeonForge. Use the CONTEXT below if relevant.\n\nCONTEXT:\n${context}\n\nIf not relevant, ignore.`
+    : `You are AeonForge. Answer clearly and concisely.`;
+
+  // Prepare streaming response
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Transfer-Encoding": "chunked",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+  });
+
+  // Abort handling: if client disconnects, stop upstream
+  const aborter = new AbortController();
+  const onClose = () => aborter.abort();
+  reply.raw.on("close", onClose);
+  reply.raw.on("error", onClose);
+
+  let accumulated = "";
+  let success = false;
+  const t0 = Date.now();
+
+  try {
+    for await (const delta of routeGenerateStream(system, q, aborter.signal)) {
+      if (aborter.signal.aborted) break;
+      accumulated += delta;
+      reply.raw.write(delta);
+    }
+    success = true;
+  } catch (e) {
+    // swallow; client may have aborted
+  } finally {
+    try { reply.raw.end(); } catch {}
+    reply.raw.off("close", onClose);
+    reply.raw.off("error", onClose);
+  }
+
+  // Record assistant message if we have any text (even partial)
+  if (accumulated.trim().length > 0) {
+    await admin.from("messages").insert({
+      conversation_id: convId!,
+      role: "assistant",
+      content: accumulated,
+    });
+  }
+
+  // Log (no model names leaked to client)
+  await admin.from("request_logs").insert({
+    user_id: userId,
+    model: "", // we could pass through internally if you want; leaving empty keeps secrecy airtight
+    tokens_in: null,
+    tokens_out: null,
+    latency_ms: Date.now() - t0,
+    success,
+  });
+
+  return; // stream already sent
 });
 
 const PORT = Number(process.env.PORT ?? 8787);

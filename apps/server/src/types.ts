@@ -14,3 +14,15 @@ export interface ConversationRow {
   title: string | null;
   created_at: string;
 }
+
+export type ProviderName = "ollama" | "together" | "echo";
+
+export interface RouteResult {
+  provider: ProviderName;
+  model: string;
+  text: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  success: boolean;
+  latency_ms: number;
+}
