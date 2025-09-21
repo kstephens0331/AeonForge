@@ -1,7 +1,7 @@
-import { admin } from "./db";
-import { CFG } from "./config";
-import { togetherEmbed } from "./models/together";
-import { ollamaEmbed } from "./models/ollama";
+import { admin } from "./db.js";
+import { CFG } from "./config.js";
+import { togetherEmbed } from "./models/together.js";
+import { ollamaEmbed } from "./models/ollama.js";
 
 /** Simple char-length chunker ~800 tokens (~3200 chars) with small overlap */
 export function chunkText(raw: string, targetChars = 3200, overlap = 300): string[] {

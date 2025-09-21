@@ -1,5 +1,5 @@
-import { CFG } from "../config";
-import type { RouteResult } from "../types";
+import { CFG } from "../config.js";
+import type { RouteResult } from "../types.js";
 
 /**
  * Together.ai (OpenAI-compatible) client

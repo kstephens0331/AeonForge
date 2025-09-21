@@ -1,4 +1,4 @@
-import { CFG } from "../config";
+import { CFG } from "../config.js";
 
 export type TogetherModel = {
   id: string;

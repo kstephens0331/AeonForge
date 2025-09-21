@@ -1,4 +1,4 @@
-import { getCatalog } from "./providers/togetherCatalog";
+import { getCatalog } from "./providers/togetherCatalog.js";
 
 export type Price = { inTok?: number; outTok?: number }; // $/token
 

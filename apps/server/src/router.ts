@@ -1,9 +1,9 @@
-import { callOllama, callOllamaStream } from "./models/ollama";
-import { togetherChat, togetherChatStream } from "./models/together";
-import { CFG } from "./config";
-import type { RouteResult } from "./types";
-import { chooseCandidates, type PolicyHints } from "./policy";
-import { getCatalog } from "./providers/togetherCatalog";
+import { callOllama, callOllamaStream } from "./models/ollama.js";
+import { togetherChat, togetherChatStream } from "./models/together.js";
+import { CFG } from "./config.js";
+import type { RouteResult } from "./types.js";
+import { chooseCandidates, type PolicyHints } from "./policy.js";
+import { getCatalog } from "./providers/togetherCatalog.js";
 
 function estTokens(s: string) {
   return Math.ceil((s ?? "").length / 4);

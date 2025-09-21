@@ -1,4 +1,4 @@
-import { CFG } from "./config";
+import { CFG } from "./config.js";
 
 const MOD_MODEL = process.env.MODERATION_MODEL_ID ?? "meta-llama/Llama-Guard-4-12B"; // adjust anytime
 

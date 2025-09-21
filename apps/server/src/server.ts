@@ -1,13 +1,14 @@
 ﻿import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { verifySupabaseJwt } from "./auth";
-import { admin } from "./db";
-import type { ConversationRow, MessageRow, Role } from "./types";
-import { routeGenerate, routeGenerateStreamWithMeta } from "./router";
+
+import { verifySupabaseJwt } from "./auth.js";
+import { admin } from "./db.js";
+import type { ConversationRow, MessageRow, Role } from "./types.js";
+import { routeGenerate, routeGenerateStreamWithMeta } from "./router.js";
 // KEEP ONLY THIS ONE:
-import { retrieveContext } from "./rag";
-import { estimateTokensFromText, costFromTokens, getTogetherPricePerToken } from "./cost";
-import { SAFE_REPLY, moderateTextOrAllow } from "./moderation";
+import { retrieveContext } from "./rag.js";
+import { estimateTokensFromText, costFromTokens, getTogetherPricePerToken } from "./cost.js";
+import { SAFE_REPLY, moderateTextOrAllow } from "./moderation.js";
 
 const fastify = Fastify({ logger: true });
 

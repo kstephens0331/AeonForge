@@ -1,5 +1,5 @@
-import { CFG } from "./config";
-import type { TogetherModel } from "./providers/togetherCatalog";
+import { CFG } from "./config.js";
+import type { TogetherModel } from "./providers/togetherCatalog.js";
 
 export type PolicyHints = {
   multilingual?: boolean;
