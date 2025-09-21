@@ -17,11 +17,16 @@ function StatusPillInline() {
       try {
         const res = await fetch("/api/healthz", { cache: "no-store" });
         if (!cancelled) setStatus(res.ok ? "online" : "offline");
-      } catch { if (!cancelled) setStatus("offline"); }
+      } catch {
+        if (!cancelled) setStatus("offline");
+      }
     }
     ping();
     const id = setInterval(ping, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
   const color = status === "online" ? "bg-emerald-400" : status === "offline" ? "bg-rose-400" : "bg-slate-400";
   const label = status === "online" ? "API online" : status === "offline" ? "API offline" : "Checking…";
@@ -80,20 +85,29 @@ export default function HomePage() {
         }
         const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${cid}/messages`, token);
         setMessages(list.messages);
-        setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 0);
-      } catch (e) { console.error(e); }
+        setTimeout(
+          () => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }),
+          0
+        );
+      } catch (e) {
+        console.error(e);
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
   const autoSize = () => {
-    const el = textareaRef.current; if (!el) return;
-    const line = 24, max = line * 6;
+    const el = textareaRef.current;
+    if (!el) return;
+    const line = 24,
+      max = line * 6;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, max)}px`;
     el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
   };
-  useEffect(() => { autoSize(); }, []);
+  useEffect(() => {
+    autoSize();
+  }, []);
 
   function appendAssistant(text: string) {
     setMessages((prev) => {
@@ -105,7 +119,6 @@ export default function HomePage() {
   }
 
   async function fallbackNonStreaming(q: string) {
-    // call /chat (non-streaming) if stream didn’t produce chunks
     if (!token) return;
     try {
       const r = await apiFetch<{ conversationId: string; text: string }>(
@@ -137,14 +150,11 @@ export default function HomePage() {
     const controller = new AbortController();
     setAborter(controller);
 
-    let gotFirstChunk = false;
-    const firstChunkTimer = setTimeout(() => {
-      if (!gotFirstChunk && !controller.signal.aborted) {
-        controller.abort(); // stop the stuck stream
-      }
-    }, 4000); // fallback if no chunk in 4s
+    let firstDataTimer: ReturnType<typeof setTimeout> | null = null;
+    let gotFirstData = false;
 
     try {
+      // --- streaming ---
       const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -157,28 +167,61 @@ export default function HomePage() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
 
+      let buffer = "";
+
+      // Aggressive fallback if we don't get any *data:* in time (ignore :ok/:hb)
+      firstDataTimer = setTimeout(() => {
+        if (!gotFirstData && !controller.signal.aborted) {
+          controller.abort(); // stop stuck/buffered stream
+        }
+      }, 2000);
+
+      function processSSE(chunkText: string) {
+        buffer += chunkText;
+        let advanced = false;
+
+        for (;;) {
+          const sep = buffer.indexOf("\n\n");
+          if (sep === -1) break; // need more
+          const block = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+
+          // Parse block lines
+          const lines = block.split("\n");
+          for (const line of lines) {
+            if (!line) continue;
+            if (line.startsWith(":")) continue; // comment/heartbeat like ":ok" or ":hb" → ignore
+            if (line.startsWith("data:")) {
+              const payload = line.slice(5).trimStart();
+              if (payload) {
+                appendAssistant(payload);
+                gotFirstData = true;
+                advanced = true;
+              }
+            }
+          }
+        }
+        return advanced;
+      }
+
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
         if (value) {
-          gotFirstChunk = true;
           const chunk = decoder.decode(value, { stream: true });
 
-          // Support both plain-text chunks and SSE ("data: ...\n\n")
-          if (chunk.includes("data:")) {
-            for (const block of chunk.split("\n\n")) {
-              const lines = block.split("\n");
-              for (const line of lines) {
-                if (line.startsWith("data:")) {
-                  appendAssistant(line.slice(5).trimStart());
-                }
-              }
+          // Support both: raw text (no SSE framing) and SSE-framed chunks
+          if (chunk.includes("data:") || chunk.startsWith(":")) {
+            const changed = processSSE(chunk);
+            if (changed) {
+              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
             }
           } else {
+            // Plain text fallback (no SSE)
             appendAssistant(chunk);
+            gotFirstData = true;
+            scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
           }
-
-          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
         }
       }
     } catch (err: unknown) {
@@ -187,7 +230,7 @@ export default function HomePage() {
         (err instanceof Error && err.name === "AbortError");
       if (!aborted) console.error(err);
     } finally {
-      clearTimeout(firstChunkTimer);
+      if (firstDataTimer) clearTimeout(firstDataTimer);
       setLoading(false);
       setAborter(null);
 
@@ -206,12 +249,19 @@ export default function HomePage() {
   }
 
   function stopRequest() {
-    if (aborter) { aborter.abort(); setAborter(null); setLoading(false); }
+    if (aborter) {
+      aborter.abort();
+      setAborter(null);
+      setLoading(false);
+    }
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
-      if (loading) { e.preventDefault(); return; }
+      if (loading) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       void sendMessage();
     }
@@ -223,7 +273,10 @@ export default function HomePage() {
         <div className="text-center space-y-4">
           <h1 className="text-2xl font-semibold">AeonForge</h1>
           <p className="text-slate-300">Please sign in to continue.</p>
-          <Link href="/login" className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition">
+          <Link
+            href="/login"
+            className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition"
+          >
             Sign in
           </Link>
         </div>
@@ -254,15 +307,23 @@ export default function HomePage() {
                     </span>
                     <span>AeonForge is thinking…</span>
                   </div>
-                  <button onClick={stopRequest}
-                          className="rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20 transition"
-                          aria-label="Stop generating" title="Stop">
+                  <button
+                    onClick={stopRequest}
+                    className="rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20 transition"
+                    aria-label="Stop generating"
+                    title="Stop"
+                  >
                     Stop
                   </button>
                 </div>
               )}
-              <button onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
-                      className="text-xs text-slate-300/80 hover:text-white">
+              <button
+                onClick={async () => {
+                  await supabase.auth.signOut();
+                  localStorage.removeItem("af_conversation_id");
+                }}
+                className="text-xs text-slate-300/80 hover:text-white"
+              >
                 Sign out
               </button>
             </div>
@@ -273,12 +334,14 @@ export default function HomePage() {
               {messages.map((m, i) => {
                 const isUser = m.role === "user";
                 return (
-                  <div key={i}
-                       className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
-                         isUser
-                           ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
-                           : "mr-auto text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,.25)] border border-white/10 bg-white/8"
-                       }`}>
+                  <div
+                    key={i}
+                    className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
+                      isUser
+                        ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
+                        : "mr-auto text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,.25)] border border-white/10 bg-white/8"
+                    }`}
+                  >
                     <div className={`mb-1 text-[11px] ${isUser ? "text-slate-300" : "text-sky-300"}`}>
                       {isUser ? "You" : "AeonForge"}
                     </div>
@@ -293,7 +356,10 @@ export default function HomePage() {
                 <textarea
                   ref={textareaRef}
                   value={input}
-                  onChange={(e) => { setInput(e.target.value); autoSize(); }}
+                  onChange={(e) => {
+                    setInput(e.target.value);
+                    autoSize();
+                  }}
                   onKeyDown={onKeyDown}
                   rows={1}
                   className="flex-1 rounded-2xl px-4 py-2.5 bg-white/10 text-slate-100 placeholder:text-slate-400/70 border border-white/10 outline-none focus:ring-2 focus:ring-sky-300/40 focus:border-white/20 resize-none leading-6 overflow-hidden"
