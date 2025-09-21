@@ -1,24 +1,29 @@
 // apps/web/src/lib/api.ts
-export const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? process.env.NEXT_PUBLIC_API_BASE ?? "")
-  .replace(/\/+$/, ""); // strip trailing slash
+const BASE = "/api"; // next.config.ts proxies this to Railway
 
-function join(base: string, path: string) {
-  return base ? `${base}${path.startsWith("/") ? path : `/${path}`}` : path; // if you later proxy /api/*, passing "/api/..." works too
+function join(path: string) {
+  return path.startsWith("/") ? `${BASE}${path}` : `${BASE}/${path}`;
 }
 
-export async function apiFetch<T>(path: string, token?: string, init: RequestInit = {}): Promise<T> {
-  const url = join(API_BASE, path);
+export async function apiFetch<T>(
+  path: string,
+  accessToken?: string,
+  init: RequestInit = {}
+): Promise<T> {
   const headers: Record<string, string> = {
     ...(init.headers as Record<string, string> | undefined),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
   };
-  // add JSON header only if there is a body and no header provided
   if (init.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
 
-  const res = await fetch(url, { ...init, headers, cache: "no-store" });
+  const res = await fetch(join(path), { ...init, headers, cache: "no-store" });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`${init.method ?? "GET"} ${path} -> ${res.status}: ${text}`);
+    let msg = `HTTP ${res.status}`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = data.error;
+    } catch {}
+    throw new Error(msg);
   }
   return res.json() as Promise<T>;
 }

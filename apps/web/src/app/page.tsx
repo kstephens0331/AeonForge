@@ -5,26 +5,22 @@ import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { apiFetch } from "@/lib/api";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787";
-
 type Role = "user" | "assistant" | "system";
 type ChatMessage = { role: Role; content: string; created_at?: string; id?: string };
 type Conversation = { id: string; title: string | null; created_at: string };
 
-/** Inline Status Pill (no import) */
 function StatusPillInline() {
   const [status, setStatus] = useState<"checking" | "online" | "offline">("checking");
-
   useEffect(() => {
     let cancelled = false;
-async function ping() {
-  try {
-    const res = await fetch(`${API_URL}/healthz`, { cache: "no-store" });
-    if (!cancelled) setStatus(res.ok ? "online" : "offline");
-  } catch {
-    if (!cancelled) setStatus("offline");
-  }
-}
+    async function ping() {
+      try {
+        const res = await fetch("/api/healthz", { cache: "no-store" });
+        if (!cancelled) setStatus(res.ok ? "online" : "offline");
+      } catch {
+        if (!cancelled) setStatus("offline");
+      }
+    }
     ping();
     const id = setInterval(ping, 30_000);
     return () => {
@@ -32,15 +28,14 @@ async function ping() {
       clearInterval(id);
     };
   }, []);
-
   const color =
     status === "online" ? "bg-emerald-400" :
-    status === "offline" ? "bg-rose-400" : "bg-slate-400";
-
+    status === "offline" ? "bg-rose-400" :
+    "bg-slate-400";
   const label =
     status === "online" ? "API online" :
-    status === "offline" ? "API offline" : "Checking…";
-
+    status === "offline" ? "API offline" :
+    "Checking…";
   return (
     <div className="fixed left-3 bottom-3 z-50 flex items-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 backdrop-blur-xl">
       <span className={`inline-block h-2 w-2 rounded-full ${color}`} />
@@ -81,7 +76,7 @@ export default function HomePage() {
     if (cid) setConversationId(cid);
   }, []);
 
-  // load existing messages
+  // load conversation + messages after we have a token
   useEffect(() => {
     if (!token) return;
     (async () => {
@@ -116,8 +111,7 @@ export default function HomePage() {
   const autoSize = () => {
     const el = textareaRef.current;
     if (!el) return;
-    const lineHeightPx = 24, maxLines = 6;
-    const max = lineHeightPx * maxLines;
+    const lineHeightPx = 24, maxLines = 6, max = lineHeightPx * maxLines;
     el.style.height = "auto";
     const next = Math.min(el.scrollHeight, max);
     el.style.height = `${next}px`;
@@ -129,7 +123,7 @@ export default function HomePage() {
     const text = input.trim();
     if (!text || !token || loading) return;
 
-    // Optimistically add user message and a placeholder AI message
+    // optimistic UI
     setMessages((prev) => [...prev, { role: "user", content: text }, { role: "assistant", content: "" }]);
     setInput("");
     requestAnimationFrame(() => autoSize());
@@ -139,58 +133,42 @@ export default function HomePage() {
     setAborter(controller);
 
     try {
-const res = await fetch(`${API_URL}/chat/stream`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-  body: JSON.stringify({ conversationId, text }),
-  signal: controller.signal,
-});
+      const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ conversationId, text }),
+        signal: controller.signal,
+      });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-
-      // (Optional) If you later send X-Conversation-Id from server, pick it up here
-      const newCid = res.headers.get("X-Conversation-Id");
-      if (newCid && !conversationId) {
-        setConversationId(newCid);
-        localStorage.setItem("af_conversation_id", newCid);
-      }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let done = false;
-
-      while (!done) {
-        const { value, done: d } = await reader.read();
-        done = d;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
         if (value) {
           const chunk = decoder.decode(value, { stream: true });
-          // append chunk to the last assistant message
           setMessages((prev) => {
             const copy = [...prev];
             const last = copy[copy.length - 1];
-            if (last && last.role === "assistant") {
-              last.content += chunk;
-            }
+            if (last && last.role === "assistant") last.content += chunk;
             return copy;
           });
-          // auto-scroll as we stream
+          // keep scrolled to the bottom as we stream
           scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
         }
       }
-     } catch (err: unknown) {
+    } catch (err: unknown) {
       const aborted =
         (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
         (err instanceof Error && err.name === "AbortError");
-
       if (!aborted) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(message);
-        // show a minimal error in the last assistant bubble if empty
         setMessages((prev) => {
           const copy = [...prev];
           const last = copy[copy.length - 1];
-          if (last && last.role === "assistant" && !last.content) {
-            last.content = "…request failed.";
-          }
+          if (last && last.role === "assistant" && !last.content) last.content = "…request failed.";
           return copy;
         });
       }
@@ -211,7 +189,7 @@ const res = await fetch(`${API_URL}/chat/stream`, {
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
-      if (loading) { e.preventDefault(); return; } // cannot send while streaming
+      if (loading) { e.preventDefault(); return; } // block while streaming
       e.preventDefault();
       void sendMessage();
     }
@@ -248,7 +226,6 @@ const res = await fetch(`${API_URL}/chat/stream`, {
                 <p className="text-[11px] sm:text-xs text-slate-300/80">{email}</p>
               </div>
             </div>
-
             <div className="flex items-center gap-3">
               {loading && (
                 <div className="flex items-center gap-2">
@@ -315,7 +292,7 @@ const res = await fetch(`${API_URL}/chat/stream`, {
                 />
                 <button
                   className="px-4 py-2.5 rounded-2xl text-slate-900 bg-sky-300 hover:bg-sky-200 active:bg-sky-300 transition shadow-[0_10px_30px_rgba(56,189,248,.35)] disabled:opacity-60"
-                  disabled={loading || !input.trim()} // typing allowed; send blocked during streaming
+                  disabled={loading || !input.trim()}
                   aria-busy={loading}
                   onClick={() => void sendMessage()}
                 >
