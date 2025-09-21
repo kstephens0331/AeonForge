@@ -176,9 +176,14 @@ const res = await fetch(`${API_URL}/chat/stream`, {
           scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
         }
       }
-    } catch (e: any) {
-      if (e?.name !== "AbortError" && e?.message !== "Request aborted") {
-        console.error(e);
+     } catch (err: unknown) {
+      const aborted =
+        (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
+        (err instanceof Error && err.name === "AbortError");
+
+      if (!aborted) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(message);
         // show a minimal error in the last assistant bubble if empty
         setMessages((prev) => {
           const copy = [...prev];
@@ -192,7 +197,6 @@ const res = await fetch(`${API_URL}/chat/stream`, {
     } finally {
       setLoading(false);
       setAborter(null);
-      // final scroll
       setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }), 16);
     }
   }
