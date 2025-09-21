@@ -12,7 +12,7 @@ import { SAFE_REPLY, moderateTextOrAllow } from "./moderation";
 const fastify = Fastify({ logger: true });
 
 fastify.register(cors, {
-  origin: "http://localhost:3000",
+  origin: ["http://localhost:3000","https://aeon-forge-web.vercel.app/"],
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 });
