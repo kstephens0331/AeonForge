@@ -1,29 +1,24 @@
-export async function apiFetch<T>(
-  path: string,
-  accessToken: string,
-  init?: RequestInit & { signal?: AbortSignal }
-): Promise<T> {
-  const res = await fetch(`http://localhost:8787${path}`, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-    },
-    ...init,
-  });
+// apps/web/src/lib/api.ts
+export const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? process.env.NEXT_PUBLIC_API_BASE ?? "")
+  .replace(/\/+$/, ""); // strip trailing slash
 
-  // If aborted, surface a friendly error
-  if (res.body === null && (init?.signal?.aborted ?? false)) {
-    throw new Error("Request aborted");
-  }
+function join(base: string, path: string) {
+  return base ? `${base}${path.startsWith("/") ? path : `/${path}`}` : path; // if you later proxy /api/*, passing "/api/..." works too
+}
 
+export async function apiFetch<T>(path: string, token?: string, init: RequestInit = {}): Promise<T> {
+  const url = join(API_BASE, path);
+  const headers: Record<string, string> = {
+    ...(init.headers as Record<string, string> | undefined),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+  // add JSON header only if there is a body and no header provided
+  if (init.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+
+  const res = await fetch(url, { ...init, headers, cache: "no-store" });
   if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const data = await res.json();
-      if (data?.error) msg = data.error;
-    } catch {}
-    throw new Error(msg);
+    const text = await res.text().catch(() => "");
+    throw new Error(`${init.method ?? "GET"} ${path} -> ${res.status}: ${text}`);
   }
-  return (await res.json()) as T;
+  return res.json() as Promise<T>;
 }
