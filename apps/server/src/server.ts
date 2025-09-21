@@ -13,8 +13,8 @@ import { SAFE_REPLY, moderateTextOrAllow } from "./moderation.js";
 const fastify = Fastify({ logger: true });
 
 /** ---------- SPEED TUNABLES ---------- */
-const RAG_TIMEOUT_MS = Number(process.env.RAG_TIMEOUT_MS ?? 500);     // cap retrieval time
-const BRIEF_MAX_WORDS = Number(process.env.BRIEF_MAX_WORDS ?? 120);   // keep answers short
+const RAG_TIMEOUT_MS = Number(process.env.RAG_TIMEOUT_MS ?? 500);       // cap retrieval time
+const BRIEF_MAX_WORDS = Number(process.env.BRIEF_MAX_WORDS ?? 120);     // keep answers short
 const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS ?? 10000); // keep connection hot
 
 function briefSystem() {
@@ -62,6 +62,7 @@ fastify.addHook("preHandler", async (req, reply) => {
     (req as any).user = payload; // { sub, email, ... }
   } catch {
     reply.code(401).send({ error: "Invalid token" });
+    return;
   }
 });
 
@@ -251,7 +252,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
 
   const t0 = Date.now();
   const r = await routeGenerate(system, q);
-  const resultText = r.text;
+  const resultText = (r.text ?? "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 
   // Store assistant message
   await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: resultText });
@@ -281,7 +282,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
   return { conversationId: convId, text: resultText };
 });
 
-/** ---------- Streaming Chat (SSE + heartbeat + flush) ---------- */
+/** ---------- Streaming Chat (SSE + heartbeat + flush + think-strip) ---------- */
 fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/stream", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { conversationId, text } = req.body ?? {};
@@ -320,18 +321,13 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
       "X-Accel-Buffering": "no",
     });
     reply.raw.write(":ok\n\n");
+    reply.raw.write("event: status\ndata: done\n\n");
     reply.raw.write(`data: ${SAFE_REPLY}\n\n`);
     try { reply.raw.end(); } catch {}
     return;
   }
 
   // ⚡️RAG with timeout
-  const ctx = await withTimeout(retrieveContext(userId, q), RAG_TIMEOUT_MS, "");
-  const system = ctx
-    ? `${briefSystem()}\n\nCONTEXT:\n${ctx}\n\nIgnore context if irrelevant.`
-    : briefSystem();
-
-  // SSE headers + immediate flush
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -339,6 +335,39 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
     "X-Accel-Buffering": "no",
   });
   reply.raw.write(":ok\n\n");
+  reply.raw.write("event: status\ndata: retrieving\n\n");
+
+  const ctx = await withTimeout(retrieveContext(userId, q), RAG_TIMEOUT_MS, "");
+  const system = ctx
+    ? `${briefSystem()}\n\nCONTEXT:\n${ctx}\n\nIgnore context if irrelevant.`
+    : briefSystem();
+
+  reply.raw.write("event: status\ndata: generating\n\n");
+
+  // think scrubber across chunk boundaries
+  let thinkOpen = false;
+  let thinkCarry = "";
+  function stripThink(delta: string): string {
+    let out = "";
+    let s = thinkCarry + delta;
+    thinkCarry = "";
+    let i = 0;
+    while (i < s.length) {
+      if (!thinkOpen) {
+        const open = s.indexOf("<think>", i);
+        if (open === -1) { out += s.slice(i); break; }
+        out += s.slice(i, open);
+        i = open + "<think>".length;
+        thinkOpen = true;
+      } else {
+        const close = s.indexOf("</think>", i);
+        if (close === -1) { thinkCarry = s.slice(i); break; }
+        i = close + "</think>".length;
+        thinkOpen = false;
+      }
+    }
+    return out;
+  }
 
   // Heartbeat to keep proxies from buffering
   const heartbeat = setInterval(() => {
@@ -363,10 +392,15 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
 
     for await (const delta of stream) {
       if (aborter.signal.aborted) break;
-      accumulated += delta;
+      const visible = stripThink(String(delta));
+      if (!visible) continue;
+      accumulated += visible;
+
       // send as SSE lines (keeps first token snappy)
-      const safe = String(delta).replace(/\r?\n/g, "\n");
+      const safe = visible.replace(/\r?\n/g, "\n");
       for (const line of safe.split("\n")) {
+        // guard against blank lines flooding
+        if (line === "") continue;
         reply.raw.write(`data: ${line}\n\n`);
       }
     }
@@ -375,23 +409,25 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
     // swallow; client may have aborted
   } finally {
     clearInterval(heartbeat);
+    reply.raw.write("event: status\ndata: done\n\n");
     try { reply.raw.end(); } catch {}
     reply.raw.off("close", onClose);
     reply.raw.off("error", onClose);
   }
 
   // Store assistant message if any text
-  if (accumulated.trim().length > 0) {
+  const finalText = accumulated.trim();
+  if (finalText.length > 0) {
     await admin.from("messages").insert({
       conversation_id: convId!,
       role: "assistant",
-      content: accumulated,
+      content: finalText,
     });
   }
 
   // Estimated cost logging
   const tokens_in = estimateTokensFromText(system) + estimateTokensFromText(q);
-  const tokens_out = estimateTokensFromText(accumulated);
+  const tokens_out = estimateTokensFromText(finalText);
   let cost_usd = 0;
 
   if (provider === "together" && togetherModelId) {

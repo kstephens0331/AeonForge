@@ -47,6 +47,7 @@ export default function HomePage() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [aborter, setAborter] = useState<AbortController | null>(null);
+  const [miniStatus, setMiniStatus] = useState<string>("");
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -99,15 +100,12 @@ export default function HomePage() {
   const autoSize = () => {
     const el = textareaRef.current;
     if (!el) return;
-    const line = 24,
-      max = line * 6;
+    const line = 24, max = line * 6;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, max)}px`;
     el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
   };
-  useEffect(() => {
-    autoSize();
-  }, []);
+  useEffect(() => { autoSize(); }, []);
 
   function appendAssistant(text: string) {
     setMessages((prev) => {
@@ -130,7 +128,9 @@ export default function HomePage() {
         setConversationId(r.conversationId);
         localStorage.setItem("af_conversation_id", r.conversationId);
       }
-      appendAssistant(r.text || "(no response)");
+      // strip <think>…</think> defensively
+      const cleaned = (r.text || "(no response)").replace(/<think>[\s\S]*?<\/think>/g, "");
+      appendAssistant(cleaned);
     } catch (e) {
       console.error(e);
       appendAssistant("…request failed.");
@@ -146,6 +146,7 @@ export default function HomePage() {
     setInput("");
     requestAnimationFrame(() => autoSize());
     setLoading(true);
+    setMiniStatus("connecting");
 
     const controller = new AbortController();
     setAborter(controller);
@@ -154,7 +155,6 @@ export default function HomePage() {
     let gotFirstData = false;
 
     try {
-      // --- streaming ---
       const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -166,7 +166,6 @@ export default function HomePage() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-
       let buffer = "";
 
       // Aggressive fallback if we don't get any *data:* in time (ignore :ok/:hb)
@@ -186,18 +185,32 @@ export default function HomePage() {
           const block = buffer.slice(0, sep);
           buffer = buffer.slice(sep + 2);
 
-          // Parse block lines
-          const lines = block.split("\n");
-          for (const line of lines) {
+          let evt: string | null = null;
+          const dataParts: string[] = [];
+
+          for (const raw of block.split("\n")) {
+            const line = raw.trimEnd();
             if (!line) continue;
-            if (line.startsWith(":")) continue; // comment/heartbeat like ":ok" or ":hb" → ignore
-            if (line.startsWith("data:")) {
-              const payload = line.slice(5).trimStart();
-              if (payload) {
-                appendAssistant(payload);
-                gotFirstData = true;
-                advanced = true;
-              }
+            if (line.startsWith(":")) continue;                 // comments like :ok / :hb → ignore
+            if (line.startsWith("event:")) { evt = line.slice(6).trim(); continue; }
+            if (line.startsWith("data:")) { dataParts.push(line.slice(5)); continue; }
+          }
+
+          const data = dataParts.join("\n").replace(/^\s+/, "");
+
+          if (evt === "status") {
+            setMiniStatus(data); // e.g., "retrieving" → "generating" → "done"
+            continue;
+          }
+
+          if (data) {
+            // client-side safety: strip any <think>…</think> that slipped through
+            const cleaned = data.replace(/<think>[\s\S]*?<\/think>/g, "");
+            if (cleaned) {
+              appendAssistant(cleaned);
+              gotFirstData = true;
+              advanced = true;
+              setMiniStatus("generating");
             }
           }
         }
@@ -218,8 +231,10 @@ export default function HomePage() {
             }
           } else {
             // Plain text fallback (no SSE)
-            appendAssistant(chunk);
+            const cleaned = chunk.replace(/<think>[\s\S]*?<\/think>/g, "");
+            appendAssistant(cleaned);
             gotFirstData = true;
+            setMiniStatus("generating");
             scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
           }
         }
@@ -233,6 +248,7 @@ export default function HomePage() {
       if (firstDataTimer) clearTimeout(firstDataTimer);
       setLoading(false);
       setAborter(null);
+      setMiniStatus("done");
 
       // If assistant bubble is still empty, use fallback
       setMessages((prev) => {
@@ -245,6 +261,7 @@ export default function HomePage() {
       });
 
       setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }), 16);
+      setTimeout(() => setMiniStatus(""), 1200);
     }
   }
 
@@ -253,6 +270,7 @@ export default function HomePage() {
       aborter.abort();
       setAborter(null);
       setLoading(false);
+      setMiniStatus("");
     }
   }
 
@@ -298,6 +316,12 @@ export default function HomePage() {
               </div>
             </div>
             <div className="flex items-center gap-3">
+              {miniStatus && (
+                <div className="hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100">
+                  <span className="h-1.5 w-1.5 rounded-full bg-sky-300" />
+                  <span>{miniStatus}</span>
+                </div>
+              )}
               {loading && (
                 <div className="flex items-center gap-2">
                   <div className="hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100">
@@ -356,10 +380,7 @@ export default function HomePage() {
                 <textarea
                   ref={textareaRef}
                   value={input}
-                  onChange={(e) => {
-                    setInput(e.target.value);
-                    autoSize();
-                  }}
+                  onChange={(e) => { setInput(e.target.value); autoSize(); }}
                   onKeyDown={onKeyDown}
                   rows={1}
                   className="flex-1 rounded-2xl px-4 py-2.5 bg-white/10 text-slate-100 placeholder:text-slate-400/70 border border-white/10 outline-none focus:ring-2 focus:ring-sky-300/40 focus:border-white/20 resize-none leading-6 overflow-hidden"
