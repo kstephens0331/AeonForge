@@ -1,137 +1,161 @@
-import { callOllama, callOllamaStream } from "./models/ollama.js";
-import { togetherChat, togetherChatStream } from "./models/together.js";
-import { CFG } from "./config.js";
+// apps/server/src/router.ts
+// Together-only router (NodeNext ESM). No Ollama, no catalog/policy cascade.
+
 import type { RouteResult } from "./types.js";
-import { chooseCandidates, type PolicyHints } from "./policy.js";
-import { getCatalog } from "./providers/togetherCatalog.js";
 
-function estTokens(s: string) {
-  return Math.ceil((s ?? "").length / 4);
+const TOGETHER_API_KEY = process.env.TOGETHER_API_KEY!;
+const TOGETHER_MODEL =
+  process.env.TOGETHER_MODEL ?? "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo";
+const MAX_TOKENS = Number(process.env.SEGMENT_MAX_TOKENS ?? 4096);
+const TEMP = Number(process.env.TOGETHER_TEMPERATURE ?? 0.2);
+const TOP_P = Number(process.env.TOGETHER_TOP_P ?? 0.9);
+
+function stripThink(s: string) {
+  return s.replace(/<think>[\s\S]*?<\/think>/g, "");
 }
 
-function clampPrompt(system: string, user: string) {
-  const inTok = estTokens(system) + estTokens(user);
-  if (inTok <= CFG.MAX_INPUT_TOKENS) return { system, user };
-  const keep = Math.floor((CFG.MAX_INPUT_TOKENS * 3) / 4);
-  const sys =
-    "You are AeonForge. The user message may be truncated for brevity. Answer helpfully.";
-  const cutUser = user.slice(-keep);
-  return { system: sys, user: cutUser };
-}
-
-async function togetherCandidates(
-  system: string,
-  user: string,
-  overrides?: Partial<PolicyHints>
-) {
-  if (!CFG.TOGETHER_API_KEY) return [];
-  const models = await getCatalog(false);
-  const hints: PolicyHints = {
-    multilingual: /[^\u0000-\u007f]/.test(user),
-    needsReasoning: /\bwhy|explain step|prove|math|logic|reason\b/i.test(user),
-    expectedInputTokens: Math.min(
-      CFG.MAX_INPUT_TOKENS,
-      estTokens(system) + estTokens(user)
-    ),
-    expectedOutputTokens: Math.min(CFG.MAX_OUTPUT_TOKENS, 800),
-    ...overrides,
-  };
-  const cands = chooseCandidates(models, hints, CFG.TOGETHER_ATTEMPTS + 2);
-  // prefer free → cheaper
-  return cands
-    .sort((a, b) => {
-      const af = a.free ? 0 : 1,
-        bf = b.free ? 0 : 1;
-      if (af !== bf) return af - bf;
-      const ap =
-        (a.pricing?.prompt ?? 1e-5) + (a.pricing?.completion ?? 1e-5);
-      const bp =
-        (b.pricing?.prompt ?? 1e-5) + (b.pricing?.completion ?? 1e-5);
-      return ap - bp;
-    })
-    .slice(0, CFG.TOGETHER_ATTEMPTS);
-}
-
-// ---------- Non-streaming main entry ----------
-export async function routeGenerate(
-  system: string,
-  user: string
-): Promise<RouteResult> {
-  const { system: sys, user: usr } = clampPrompt(system, user);
-
-  // 1) Local-first (Ollama)
-  try {
-    const prompt = `${sys}\n\nUser:\n${usr}`;
-    return await callOllama(prompt);
-  } catch {
-    // continue to cloud
-  }
-
-  // 2) Together cascade
-  try {
-    const cands = await togetherCandidates(sys, usr);
-    for (const m of cands) {
-      try {
-        const r = await togetherChat(sys, usr, m.id);
-        return r;
-      } catch {
-        // try next candidate
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  // 3) Echo fallback — never fail
+/** One-shot completion (non-streaming) */
+export async function routeGenerate(system: string, user: string): Promise<RouteResult> {
   const t0 = Date.now();
+
+  if (!TOGETHER_API_KEY) {
+    return {
+      provider: "together",
+      model: TOGETHER_MODEL,
+      text: "Server missing TOGETHER_API_KEY.",
+      success: false,
+      latency_ms: Date.now() - t0,
+    };
+    }
+
+  const res = await fetch("https://api.together.xyz/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOGETHER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: TOGETHER_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: TEMP,
+      top_p: TOP_P,
+      max_tokens: MAX_TOKENS,
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    return {
+      provider: "together",
+      model: TOGETHER_MODEL,
+      text: `Together HTTP ${res.status}: ${body || "request failed"}`,
+      success: false,
+      latency_ms: Date.now() - t0,
+    };
+  }
+
+  const j = await res.json();
+  const content: string =
+    j?.choices?.[0]?.message?.content ??
+    j?.choices?.[0]?.text ??
+    "";
+  const usage = j?.usage ?? {};
+
   return {
-    provider: "echo",
-    model: "echo",
-    text: `Echo: ${usr}`,
+    provider: "together",
+    model: TOGETHER_MODEL,
+    text: stripThink(content || ""),
     success: true,
+    tokens_in: usage?.prompt_tokens,
+    tokens_out: usage?.completion_tokens,
     latency_ms: Date.now() - t0,
   };
 }
 
-// ---------- Streaming main entry (with meta) ----------
+/** Internal: Together streaming generator */
+async function* togetherStream(system: string, user: string, signal?: AbortSignal) {
+  if (!TOGETHER_API_KEY) {
+    throw new Error("TOGETHER_API_KEY missing");
+  }
+
+  const res = await fetch("https://api.together.xyz/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOGETHER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: TOGETHER_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: TEMP,
+      top_p: TOP_P,
+      max_tokens: MAX_TOKENS,
+      stream: true,
+    }),
+    signal,
+  });
+
+  if (!res.ok || !res.body) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Together stream HTTP ${res.status}: ${body}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let carry = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    carry += chunk;
+
+    // Parse Server-Sent Events frames: blocks separated by "\n\n"
+    for (;;) {
+      const idx = carry.indexOf("\n\n");
+      if (idx === -1) break;
+      const block = carry.slice(0, idx);
+      carry = carry.slice(idx + 2);
+
+      for (const line of block.split("\n")) {
+        const s = line.trim();
+        if (!s || s.startsWith(":")) continue;   // comments/heartbeats
+        if (!s.startsWith("data:")) continue;
+        const payload = s.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+
+        try {
+          const j = JSON.parse(payload);
+          const piece: string =
+            j?.choices?.[0]?.delta?.content ??
+            j?.choices?.[0]?.text ??
+            "";
+          if (piece) yield stripThink(piece);
+        } catch {
+          // ignore parse errors for malformed frames
+        }
+      }
+    }
+  }
+}
+
+/** Streaming with meta (matches existing server usage) */
 export async function routeGenerateStreamWithMeta(
   system: string,
   user: string,
   signal?: AbortSignal
 ): Promise<{
-  provider: "local" | "together" | "echo";
-  modelId?: string;
+  provider: "together";
+  modelId: string;
   stream: AsyncGenerator<string>;
 }> {
-  const { system: sys, user: usr } = clampPrompt(system, user);
-
-  // 1) Local stream
-  try {
-    const prompt = `${sys}\n\nUser:\n${usr}`;
-    const stream = callOllamaStream(prompt, signal);
-    return { provider: "local", stream };
-  } catch {
-    // continue
-  }
-
-  // 2) Together stream (choose best now so we can price it later)
-  try {
-    const cands = await togetherCandidates(sys, usr);
-    for (const m of cands) {
-      try {
-        const stream = togetherChatStream(sys, usr, m.id, signal);
-        return { provider: "together", modelId: m.id, stream };
-      } catch {
-        // next
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  // 3) Echo stream
-  async function* echoGen() {
-    yield `Echo: ${usr}`;
-  }
-  return { provider: "echo", stream: echoGen() };
+  const stream = togetherStream(system, user, signal);
+  return { provider: "together", modelId: TOGETHER_MODEL, stream };
 }

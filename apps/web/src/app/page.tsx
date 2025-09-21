@@ -23,10 +23,7 @@ function StatusPillInline() {
     }
     ping();
     const id = setInterval(ping, 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    return () => { cancelled = true; clearInterval(id); };
   }, []);
   const color = status === "online" ? "bg-emerald-400" : status === "offline" ? "bg-rose-400" : "bg-slate-400";
   const label = status === "online" ? "API online" : status === "offline" ? "API offline" : "Checking…";
@@ -86,10 +83,7 @@ export default function HomePage() {
         }
         const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${cid}/messages`, token);
         setMessages(list.messages);
-        setTimeout(
-          () => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }),
-          0
-        );
+        setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 0);
       } catch (e) {
         console.error(e);
       }
@@ -98,8 +92,7 @@ export default function HomePage() {
   }, [token]);
 
   const autoSize = () => {
-    const el = textareaRef.current;
-    if (!el) return;
+    const el = textareaRef.current; if (!el) return;
     const line = 24, max = line * 6;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, max)}px`;
@@ -107,32 +100,61 @@ export default function HomePage() {
   };
   useEffect(() => { autoSize(); }, []);
 
+  function pushAssistantIfNeeded() {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (!last || last.role !== "assistant") {
+        return [...prev, { role: "assistant", content: "" }];
+      }
+      return prev;
+    });
+  }
+
   function appendAssistant(text: string) {
     setMessages((prev) => {
       const copy = [...prev];
-      const last = copy[copy.length - 1];
-      if (last && last.role === "assistant") last.content += text;
+      // ensure assistant exists
+      if (!copy.length || copy[copy.length - 1].role !== "assistant") {
+        copy.push({ role: "assistant", content: "" });
+      }
+      copy[copy.length - 1].content += text;
       return copy;
     });
   }
 
-  async function fallbackNonStreaming(q: string) {
+  function detectRequestedWords(s: string): number | null {
+    // catch "4000 words", "4k words", "4,000 word"
+    const k = s.match(/(\d+(?:[\.,]\d+)?)\s*k\s*words?/i);
+    if (k) {
+      const n = Math.round(parseFloat(k[1].replace(",", ".")) * 1000);
+      return isFinite(n) ? n : null;
+    }
+    const m = s.match(/(\d{3,6})\s*words?/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,._]/g, ""), 10);
+      return isFinite(n) ? n : null;
+    }
+    return null;
+  }
+
+  async function fallbackNonStreaming(q: string, targetWords?: number | null) {
     if (!token) return;
     try {
       const r = await apiFetch<{ conversationId: string; text: string }>(
         "/chat",
         token,
-        { method: "POST", body: JSON.stringify({ conversationId, text: q }) }
+        { method: "POST", body: JSON.stringify({ conversationId, text: q, targetWords }) }
       );
       if (!conversationId && r.conversationId) {
         setConversationId(r.conversationId);
         localStorage.setItem("af_conversation_id", r.conversationId);
       }
-      // strip <think>…</think> defensively
       const cleaned = (r.text || "(no response)").replace(/<think>[\s\S]*?<\/think>/g, "");
+      pushAssistantIfNeeded();
       appendAssistant(cleaned);
     } catch (e) {
       console.error(e);
+      pushAssistantIfNeeded();
       appendAssistant("…request failed.");
     }
   }
@@ -141,8 +163,8 @@ export default function HomePage() {
     const text = input.trim();
     if (!text || !token || loading) return;
 
-    // optimistic UI
-    setMessages((prev) => [...prev, { role: "user", content: text }, { role: "assistant", content: "" }]);
+    // only the user bubble up front
+    setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
     requestAnimationFrame(() => autoSize());
     setLoading(true);
@@ -151,6 +173,9 @@ export default function HomePage() {
     const controller = new AbortController();
     setAborter(controller);
 
+    const requestedWords = detectRequestedWords(text);
+    const targetWords = requestedWords && requestedWords >= 800 ? Math.min(requestedWords, 20000) : undefined;
+
     let firstDataTimer: ReturnType<typeof setTimeout> | null = null;
     let gotFirstData = false;
 
@@ -158,7 +183,7 @@ export default function HomePage() {
       const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ conversationId, text }),
+        body: JSON.stringify({ conversationId, text, targetWords }),
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -168,10 +193,10 @@ export default function HomePage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      // Aggressive fallback if we don't get any *data:* in time (ignore :ok/:hb)
+      // 2s “no first byte” cutoff → fallback
       firstDataTimer = setTimeout(() => {
         if (!gotFirstData && !controller.signal.aborted) {
-          controller.abort(); // stop stuck/buffered stream
+          controller.abort();
         }
       }, 2000);
 
@@ -181,7 +206,7 @@ export default function HomePage() {
 
         for (;;) {
           const sep = buffer.indexOf("\n\n");
-          if (sep === -1) break; // need more
+          if (sep === -1) break;
           const block = buffer.slice(0, sep);
           buffer = buffer.slice(sep + 2);
 
@@ -191,7 +216,7 @@ export default function HomePage() {
           for (const raw of block.split("\n")) {
             const line = raw.trimEnd();
             if (!line) continue;
-            if (line.startsWith(":")) continue;                 // comments like :ok / :hb → ignore
+            if (line.startsWith(":")) continue;                 // comments :ok / :hb
             if (line.startsWith("event:")) { evt = line.slice(6).trim(); continue; }
             if (line.startsWith("data:")) { dataParts.push(line.slice(5)); continue; }
           }
@@ -199,12 +224,12 @@ export default function HomePage() {
           const data = dataParts.join("\n").replace(/^\s+/, "");
 
           if (evt === "status") {
-            setMiniStatus(data); // e.g., "retrieving" → "generating" → "done"
+            setMiniStatus(data); // retrieving/generating/done/segment-*/complete
             continue;
           }
 
           if (data) {
-            // client-side safety: strip any <think>…</think> that slipped through
+            if (!gotFirstData) pushAssistantIfNeeded(); // create assistant block on first real data
             const cleaned = data.replace(/<think>[\s\S]*?<\/think>/g, "");
             if (cleaned) {
               appendAssistant(cleaned);
@@ -222,15 +247,13 @@ export default function HomePage() {
         if (done) break;
         if (value) {
           const chunk = decoder.decode(value, { stream: true });
-
-          // Support both: raw text (no SSE framing) and SSE-framed chunks
           if (chunk.includes("data:") || chunk.startsWith(":")) {
             const changed = processSSE(chunk);
             if (changed) {
               scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
             }
           } else {
-            // Plain text fallback (no SSE)
+            if (!gotFirstData) pushAssistantIfNeeded();
             const cleaned = chunk.replace(/<think>[\s\S]*?<\/think>/g, "");
             appendAssistant(cleaned);
             gotFirstData = true;
@@ -250,18 +273,17 @@ export default function HomePage() {
       setAborter(null);
       setMiniStatus("done");
 
-      // If assistant bubble is still empty, use fallback
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant" && !last.content) {
-          // call fallback outside setState
-          void fallbackNonStreaming(text);
-        }
-        return prev;
-      });
-
-      setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }), 16);
-      setTimeout(() => setMiniStatus(""), 1200);
+      // If nothing ever arrived, fallback now
+      setTimeout(() => {
+        setMiniStatus("");
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== "assistant") {
+            void fallbackNonStreaming(text, targetWords);
+          }
+          return prev;
+        });
+      }, 600);
     }
   }
 
@@ -276,10 +298,7 @@ export default function HomePage() {
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
-      if (loading) {
-        e.preventDefault();
-        return;
-      }
+      if (loading) { e.preventDefault(); return; }
       e.preventDefault();
       void sendMessage();
     }
@@ -291,10 +310,7 @@ export default function HomePage() {
         <div className="text-center space-y-4">
           <h1 className="text-2xl font-semibold">AeonForge</h1>
           <p className="text-slate-300">Please sign in to continue.</p>
-          <Link
-            href="/login"
-            className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition"
-          >
+          <Link href="/login" className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition">
             Sign in
           </Link>
         </div>
@@ -329,7 +345,7 @@ export default function HomePage() {
                       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-300 opacity-75"></span>
                       <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-300"></span>
                     </span>
-                    <span>AeonForge is thinking…</span>
+                    <span>Thinking…</span>
                   </div>
                   <button
                     onClick={stopRequest}
@@ -342,10 +358,7 @@ export default function HomePage() {
                 </div>
               )}
               <button
-                onClick={async () => {
-                  await supabase.auth.signOut();
-                  localStorage.removeItem("af_conversation_id");
-                }}
+                onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
                 className="text-xs text-slate-300/80 hover:text-white"
               >
                 Sign out
@@ -363,7 +376,7 @@ export default function HomePage() {
                     className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
                       isUser
                         ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
-                        : "mr-auto text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,.25)] border border-white/10 bg-white/8"
+                        : "mr-auto text-slate-100 border border-white/10 bg-transparent shadow-none"
                     }`}
                   >
                     <div className={`mb-1 text-[11px] ${isUser ? "text-slate-300" : "text-sky-300"}`}>
