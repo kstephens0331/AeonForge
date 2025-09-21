@@ -3,8 +3,11 @@ import cors from "@fastify/cors";
 import { verifySupabaseJwt } from "./auth";
 import { admin } from "./db";
 import type { ConversationRow, MessageRow, Role } from "./types";
-import { routeGenerate, routeGenerateStream } from "./router";
-import { retrieveContext } from "./ragSearch";
+import { routeGenerate, routeGenerateStreamWithMeta } from "./router";
+// KEEP ONLY THIS ONE:
+import { retrieveContext } from "./rag";
+import { estimateTokensFromText, costFromTokens, getTogetherPricePerToken } from "./cost";
+import { SAFE_REPLY, moderateTextOrAllow } from "./moderation";
 
 const fastify = Fastify({ logger: true });
 
@@ -108,7 +111,7 @@ fastify.post<{
   return { message: data as MessageRow };
 });
 
-// -------- RAG Ingest (from earlier) --------
+// -------- RAG Ingest (unchanged) --------
 fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { text, filename } = req.body ?? {};
@@ -179,7 +182,7 @@ fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest"
   return { documentId: doc.id, filename: doc.filename, chunks: pieces.length, embedded: Boolean(embeddings) };
 });
 
-// -------- Non-streaming Chat (kept for compatibility; hides provider/model) --------
+// -------- Non-streaming Chat (with moderation + cost logging) --------
 fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { conversationId, text } = req.body;
@@ -203,29 +206,56 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
   // Insert user message
   await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
 
+  // Moderation (never dead-end)
+  const verdict = await moderateTextOrAllow(q);
+  if (verdict === "block") {
+    const safe = SAFE_REPLY;
+    await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: safe });
+    await admin.from("request_logs").insert({
+      user_id: userId, model: "cloud", tokens_in: 0, tokens_out: 0, latency_ms: 0, success: true, cost_usd: 0
+    });
+    return { conversationId: convId, text: safe };
+  }
+
   // RAG context
   const context = await retrieveContext(userId, q);
   const system = context
     ? `You are AeonForge. Use the CONTEXT below if relevant.\n\nCONTEXT:\n${context}\n\nIf not relevant, ignore.`
     : `You are AeonForge. Answer clearly and concisely.`;
 
-  // Generate
+  const t0 = Date.now();
   const r = await routeGenerate(system, q);
   const resultText = r.text;
 
   // Store assistant message
   await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: resultText });
 
-  // Log
-  void admin.from("request_logs").insert({
-    user_id: userId, model: `${r.provider}:${r.model}`, tokens_in: r.tokens_in ?? null,
-    tokens_out: r.tokens_out ?? null, latency_ms: r.latency_ms, success: r.success,
+  // ---- Cost logging ----
+  let tokens_in = r.tokens_in ?? estimateTokensFromText(system) + estimateTokensFromText(q);
+  let tokens_out = r.tokens_out ?? estimateTokensFromText(resultText);
+  let cost_usd = 0;
+
+  if (r.provider === "together" && r.model) {
+    try {
+      const p = await getTogetherPricePerToken(r.model);
+      cost_usd = costFromTokens(tokens_in, tokens_out, p);
+    } catch {}
+  } // local/echo → cost 0
+
+  await admin.from("request_logs").insert({
+    user_id: userId,
+    model: r.provider === "together" ? "cloud" : r.provider, // do NOT leak exact model to users
+    tokens_in,
+    tokens_out,
+    latency_ms: Date.now() - t0,
+    success: r.success,
+    cost_usd,
   });
 
   return { conversationId: convId, text: resultText };
 });
 
-// -------- Streaming Chat (new) --------
+// -------- Streaming Chat (with moderation + cost logging) --------
 fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/stream", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { conversationId, text } = req.body ?? {};
@@ -253,6 +283,16 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
   // Insert user message
   await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
 
+  // Moderation (never opens stream if blocked)
+  const verdict = await moderateTextOrAllow(q);
+  if (verdict === "block") {
+    await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: SAFE_REPLY });
+    await admin.from("request_logs").insert({
+      user_id: userId, model: "cloud", tokens_in: 0, tokens_out: 0, latency_ms: 0, success: true, cost_usd: 0
+    });
+    return reply.send(SAFE_REPLY);
+  }
+
   // Compose system with RAG
   const context = await retrieveContext(userId, q);
   const system = context
@@ -273,18 +313,24 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
   reply.raw.on("close", onClose);
   reply.raw.on("error", onClose);
 
+  const t0 = Date.now();
   let accumulated = "";
   let success = false;
-  const t0 = Date.now();
+  let provider: "local" | "together" | "echo" = "echo";
+  let togetherModelId: string | undefined;
 
   try {
-    for await (const delta of routeGenerateStream(system, q, aborter.signal)) {
+    const { provider: p, modelId, stream } = await routeGenerateStreamWithMeta(system, q, aborter.signal);
+    provider = p;
+    togetherModelId = modelId;
+
+    for await (const delta of stream) {
       if (aborter.signal.aborted) break;
       accumulated += delta;
       reply.raw.write(delta);
     }
     success = true;
-  } catch (e) {
+  } catch {
     // swallow; client may have aborted
   } finally {
     try { reply.raw.end(); } catch {}
@@ -292,7 +338,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
     reply.raw.off("error", onClose);
   }
 
-  // Record assistant message if we have any text (even partial)
+  // Store assistant message if any text
   if (accumulated.trim().length > 0) {
     await admin.from("messages").insert({
       conversation_id: convId!,
@@ -301,14 +347,26 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
     });
   }
 
-  // Log (no model names leaked to client)
+  // ---- Cost logging (estimate for streaming) ----
+  const tokens_in = estimateTokensFromText(system) + estimateTokensFromText(q);
+  const tokens_out = estimateTokensFromText(accumulated);
+  let cost_usd = 0;
+
+  if (provider === "together" && togetherModelId) {
+    try {
+      const p = await getTogetherPricePerToken(togetherModelId);
+      cost_usd = costFromTokens(tokens_in, tokens_out, p);
+    } catch {}
+  }
+
   await admin.from("request_logs").insert({
     user_id: userId,
-    model: "", // we could pass through internally if you want; leaving empty keeps secrecy airtight
-    tokens_in: null,
-    tokens_out: null,
+    model: provider === "together" ? "cloud" : provider, // hide exact model
+    tokens_in,
+    tokens_out,
     latency_ms: Date.now() - t0,
     success,
+    cost_usd,
   });
 
   return; // stream already sent

@@ -1,72 +1,87 @@
 import { CFG } from "../config";
 import type { RouteResult } from "../types";
 
-const BASE = CFG.TOGETHER_BASE_URL;
+/**
+ * Together.ai (OpenAI-compatible) client
+ * Endpoints:
+ *  - POST /v1/chat/completions      (chat & stream)
+ *  - POST /v1/embeddings            (embeddings)
+ */
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return await Promise.race([
-    p,
-    new Promise<T>((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
-  ]);
-}
+const BASE = CFG.TOGETHER_BASE_URL.replace(/\/+$/, "");
 
-function authHeaders(json = true) {
-  if (!CFG.TOGETHER_API_KEY) throw new Error("together-missing-key");
-  const h: Record<string, string> = { Authorization: `Bearer ${CFG.TOGETHER_API_KEY}` };
-  if (json) h["Content-Type"] = "application/json";
-  return h;
-}
-
-export async function togetherChat(
-  system: string,
-  user: string,
-  model = CFG.TOGETHER_CHAT_MODEL
-): Promise<RouteResult> {
-  const t0 = Date.now();
-  const res = await withTimeout(
-    fetch(`${BASE}/v1/chat/completions`, {
-      method: "POST",
-      headers: authHeaders(true),
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0.2,
-      }),
-    }),
-    CFG.TIMEOUT_MS_CLOUD
-  );
-  if (!res.ok) throw new Error(`together-chat ${res.status}`);
-  const data = await res.json();
-  const text = data?.choices?.[0]?.message?.content?.trim?.() ?? "";
-
+function authHeaders() {
+  if (!CFG.TOGETHER_API_KEY) throw new Error("Together API key missing");
   return {
-    provider: "together",
-    model,
-    text,
-    success: true,
-    latency_ms: Date.now() - t0,
-    tokens_in: data?.usage?.prompt_tokens,
-    tokens_out: data?.usage?.completion_tokens,
+    Authorization: `Bearer ${CFG.TOGETHER_API_KEY}`,
+    "Content-Type": "application/json",
   };
 }
 
-/** Streaming generator of text deltas from Together (OpenAI-compatible stream) */
+// ---------- Chat (non-stream) ----------
+export async function togetherChat(
+  system: string,
+  user: string,
+  modelId = CFG.TOGETHER_CHAT_MODEL
+): Promise<RouteResult> {
+  const url = `${BASE}/v1/chat/completions`;
+  const t0 = Date.now();
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: modelId,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await safeText(res);
+    throw new Error(`together chat ${res.status}: ${body}`);
+  }
+
+  const data = await res.json();
+
+  const text: string =
+    data?.choices?.[0]?.message?.content ??
+    data?.choices?.[0]?.delta?.content ??
+    "";
+
+  // Usage (tokens) is often included on non-stream calls
+  const tokens_in: number | undefined = data?.usage?.prompt_tokens;
+  const tokens_out: number | undefined = data?.usage?.completion_tokens;
+
+  return {
+    provider: "together",
+    model: modelId,
+    text,
+    success: true,
+    latency_ms: Date.now() - t0,
+    tokens_in,
+    tokens_out,
+  };
+}
+
+// ---------- Chat (stream) ----------
 export async function* togetherChatStream(
   system: string,
   user: string,
-  model = CFG.TOGETHER_CHAT_MODEL,
+  modelId = CFG.TOGETHER_CHAT_MODEL,
   signal?: AbortSignal
 ): AsyncGenerator<string, void, unknown> {
-  if (!CFG.TOGETHER_API_KEY) throw new Error("together-missing-key");
+  const url = `${BASE}/v1/chat/completions`;
 
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
+  const res = await fetch(url, {
     method: "POST",
-    headers: authHeaders(true),
+    headers: authHeaders(),
     body: JSON.stringify({
-      model,
+      model: modelId,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -76,61 +91,82 @@ export async function* togetherChatStream(
     }),
     signal,
   });
-  if (!res.ok || !res.body) throw new Error(`together-chat ${res.status}`);
+
+  if (!res.ok || !res.body) {
+    const body = await safeText(res);
+    throw new Error(`together stream ${res.status}: ${body}`);
+  }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
 
+  // Together streams Server-Sent Events (like OpenAI)
+  // Lines prefixed with "data: {json}" until "data: [DONE]"
   try {
-    let buffer = "";
+    let buf = "";
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      buf += decoder.decode(value, { stream: true });
 
-      // OpenAI-compatible: lines starting with "data: {json}"
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? ""; // keep tail for next read
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
 
-      for (const line of lines) {
-        const s = line.trim();
-        if (!s.startsWith("data:")) continue;
-        const payload = s.slice(5).trim();
+        if (!line || !line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
         if (payload === "[DONE]") return;
 
         try {
           const obj = JSON.parse(payload);
-          const delta = obj?.choices?.[0]?.delta?.content ?? "";
-          if (delta) yield delta as string;
+          const delta: string =
+            obj?.choices?.[0]?.delta?.content ??
+            obj?.choices?.[0]?.message?.content ??
+            "";
+          if (delta) yield String(delta);
         } catch {
-          // ignore malformed split lines
+          // ignore malformed frames
         }
       }
     }
   } finally {
-    try { reader.releaseLock(); } catch {}
+    try {
+      reader.releaseLock();
+    } catch {}
   }
 }
 
-/** Embeddings + (optional) moderation stubs kept from earlier */
-export async function togetherEmbed(texts: string[], model = CFG.TOGETHER_EMB_MODEL): Promise<number[][]> {
-  const res = await withTimeout(
-    fetch(`${BASE}/v1/embeddings`, {
-      method: "POST",
-      headers: authHeaders(true),
-      body: JSON.stringify({ model, input: texts }),
+// ---------- Embeddings ----------
+export async function togetherEmbed(texts: string[]): Promise<number[][]> {
+  // Batch-friendly (Together accepts array input)
+  if (!texts?.length) return [];
+  const url = `${BASE}/v1/embeddings`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: CFG.TOGETHER_EMB_MODEL,
+      input: texts,
     }),
-    CFG.TIMEOUT_MS_CLOUD
-  );
-  if (!res.ok) throw new Error(`together-embed ${res.status}`);
+  });
+
+  if (!res.ok) {
+    const body = await safeText(res);
+    throw new Error(`together embed ${res.status}: ${body}`);
+  }
+
   const data = await res.json();
-  return (data?.data ?? []).map((d: any) => d?.embedding as number[]);
+  const arr: number[][] = (data?.data ?? []).map((d: any) => d?.embedding ?? []);
+  return arr;
 }
 
-export async function togetherModerate(_text: string): Promise<{ allowed: boolean; label?: string }> {
-  return { allowed: true };
+// ---------- utils ----------
+async function safeText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
 }
-
-export async function togetherImage(_prompt: string): Promise<string> { return ""; }
-export async function togetherTTS(_text: string): Promise<ArrayBuffer> { return new ArrayBuffer(0); }
-export async function togetherASR(_audio: ArrayBuffer): Promise<string> { return ""; }

@@ -15,14 +15,16 @@ export interface ConversationRow {
   created_at: string;
 }
 
-export type ProviderName = "ollama" | "together" | "echo";
+export type ProviderName = "local" | "together" | "echo";
 
-export interface RouteResult {
+export type RouteResult = {
   provider: ProviderName;
+  /** Internal-only model identifier. For secrecy we never return this to the client */
   model: string;
   text: string;
-  tokens_in?: number;
-  tokens_out?: number;
   success: boolean;
   latency_ms: number;
-}
+  /** Optional token usage when the provider supplies it (Together non-stream) */
+  tokens_in?: number;
+  tokens_out?: number;
+};
