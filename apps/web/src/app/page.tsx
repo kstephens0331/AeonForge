@@ -17,25 +17,14 @@ function StatusPillInline() {
       try {
         const res = await fetch("/api/healthz", { cache: "no-store" });
         if (!cancelled) setStatus(res.ok ? "online" : "offline");
-      } catch {
-        if (!cancelled) setStatus("offline");
-      }
+      } catch { if (!cancelled) setStatus("offline"); }
     }
     ping();
     const id = setInterval(ping, 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    return () => { cancelled = true; clearInterval(id); };
   }, []);
-  const color =
-    status === "online" ? "bg-emerald-400" :
-    status === "offline" ? "bg-rose-400" :
-    "bg-slate-400";
-  const label =
-    status === "online" ? "API online" :
-    status === "offline" ? "API offline" :
-    "Checking…";
+  const color = status === "online" ? "bg-emerald-400" : status === "offline" ? "bg-rose-400" : "bg-slate-400";
+  const label = status === "online" ? "API online" : status === "offline" ? "API offline" : "Checking…";
   return (
     <div className="fixed left-3 bottom-3 z-50 flex items-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 backdrop-blur-xl">
       <span className={`inline-block h-2 w-2 rounded-full ${color}`} />
@@ -57,7 +46,6 @@ export default function HomePage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // session watcher
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       setEmail(data.session?.user?.email ?? null);
@@ -70,13 +58,11 @@ export default function HomePage() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // hydrate conversationId
   useEffect(() => {
     const cid = localStorage.getItem("af_conversation_id");
     if (cid) setConversationId(cid);
   }, []);
 
-  // load conversation + messages after we have a token
   useEffect(() => {
     if (!token) return;
     (async () => {
@@ -92,32 +78,51 @@ export default function HomePage() {
           setConversationId(cid);
           localStorage.setItem("af_conversation_id", cid);
         }
-        const list = await apiFetch<{ messages: ChatMessage[] }>(
-          `/conversations/${cid}/messages`,
-          token
-        );
+        const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${cid}/messages`, token);
         setMessages(list.messages);
-        setTimeout(() => {
-          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-        }, 0);
-      } catch (e) {
-        console.error(e);
-      }
+        setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 0);
+      } catch (e) { console.error(e); }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
-  // autosize textarea (max 6 lines)
   const autoSize = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const lineHeightPx = 24, maxLines = 6, max = lineHeightPx * maxLines;
+    const el = textareaRef.current; if (!el) return;
+    const line = 24, max = line * 6;
     el.style.height = "auto";
-    const next = Math.min(el.scrollHeight, max);
-    el.style.height = `${next}px`;
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`;
     el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
   };
   useEffect(() => { autoSize(); }, []);
+
+  function appendAssistant(text: string) {
+    setMessages((prev) => {
+      const copy = [...prev];
+      const last = copy[copy.length - 1];
+      if (last && last.role === "assistant") last.content += text;
+      return copy;
+    });
+  }
+
+  async function fallbackNonStreaming(q: string) {
+    // call /chat (non-streaming) if stream didn’t produce chunks
+    if (!token) return;
+    try {
+      const r = await apiFetch<{ conversationId: string; text: string }>(
+        "/chat",
+        token,
+        { method: "POST", body: JSON.stringify({ conversationId, text: q }) }
+      );
+      if (!conversationId && r.conversationId) {
+        setConversationId(r.conversationId);
+        localStorage.setItem("af_conversation_id", r.conversationId);
+      }
+      appendAssistant(r.text || "(no response)");
+    } catch (e) {
+      console.error(e);
+      appendAssistant("…request failed.");
+    }
+  }
 
   async function sendMessage() {
     const text = input.trim();
@@ -132,6 +137,13 @@ export default function HomePage() {
     const controller = new AbortController();
     setAborter(controller);
 
+    let gotFirstChunk = false;
+    const firstChunkTimer = setTimeout(() => {
+      if (!gotFirstChunk && !controller.signal.aborted) {
+        controller.abort(); // stop the stuck stream
+      }
+    }, 4000); // fallback if no chunk in 4s
+
     try {
       const res = await fetch("/api/chat/stream", {
         method: "POST",
@@ -139,22 +151,33 @@ export default function HomePage() {
         body: JSON.stringify({ conversationId, text }),
         signal: controller.signal,
       });
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.body) throw new Error("No response body");
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
         if (value) {
+          gotFirstChunk = true;
           const chunk = decoder.decode(value, { stream: true });
-          setMessages((prev) => {
-            const copy = [...prev];
-            const last = copy[copy.length - 1];
-            if (last && last.role === "assistant") last.content += chunk;
-            return copy;
-          });
-          // keep scrolled to the bottom as we stream
+
+          // Support both plain-text chunks and SSE ("data: ...\n\n")
+          if (chunk.includes("data:")) {
+            for (const block of chunk.split("\n\n")) {
+              const lines = block.split("\n");
+              for (const line of lines) {
+                if (line.startsWith("data:")) {
+                  appendAssistant(line.slice(5).trimStart());
+                }
+              }
+            }
+          } else {
+            appendAssistant(chunk);
+          }
+
           scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
         }
       }
@@ -162,34 +185,33 @@ export default function HomePage() {
       const aborted =
         (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
         (err instanceof Error && err.name === "AbortError");
-      if (!aborted) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(message);
-        setMessages((prev) => {
-          const copy = [...prev];
-          const last = copy[copy.length - 1];
-          if (last && last.role === "assistant" && !last.content) last.content = "…request failed.";
-          return copy;
-        });
-      }
+      if (!aborted) console.error(err);
     } finally {
+      clearTimeout(firstChunkTimer);
       setLoading(false);
       setAborter(null);
+
+      // If assistant bubble is still empty, use fallback
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && !last.content) {
+          // call fallback outside setState
+          void fallbackNonStreaming(text);
+        }
+        return prev;
+      });
+
       setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }), 16);
     }
   }
 
   function stopRequest() {
-    if (aborter) {
-      aborter.abort();
-      setAborter(null);
-      setLoading(false);
-    }
+    if (aborter) { aborter.abort(); setAborter(null); setLoading(false); }
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
-      if (loading) { e.preventDefault(); return; } // block while streaming
+      if (loading) { e.preventDefault(); return; }
       e.preventDefault();
       void sendMessage();
     }
@@ -201,10 +223,7 @@ export default function HomePage() {
         <div className="text-center space-y-4">
           <h1 className="text-2xl font-semibold">AeonForge</h1>
           <p className="text-slate-300">Please sign in to continue.</p>
-          <Link
-            href="/login"
-            className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition"
-          >
+          <Link href="/login" className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition">
             Sign in
           </Link>
         </div>
@@ -217,7 +236,6 @@ export default function HomePage() {
       <StatusPillInline />
       <div className="h-full w-full px-4 md:px-6 lg:px-10 py-6">
         <div className="mx-auto h-full max-w-6xl rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-[0_20px_120px_rgba(0,0,0,.35)] overflow-hidden">
-          {/* Header */}
           <div className="flex items-center justify-between border-b border-white/10 bg-white/5 px-5 sm:px-8 py-4">
             <div className="flex items-center gap-3">
               <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-sky-400 to-teal-300 shadow-[0_6px_20px_rgba(56,189,248,.35)]" />
@@ -236,39 +254,31 @@ export default function HomePage() {
                     </span>
                     <span>AeonForge is thinking…</span>
                   </div>
-                  <button
-                    onClick={stopRequest}
-                    className="rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20 transition"
-                    aria-label="Stop generating"
-                    title="Stop"
-                  >
+                  <button onClick={stopRequest}
+                          className="rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20 transition"
+                          aria-label="Stop generating" title="Stop">
                     Stop
                   </button>
                 </div>
               )}
-              <button
-                onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
-                className="text-xs text-slate-300/80 hover:text-white"
-              >
+              <button onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
+                      className="text-xs text-slate-300/80 hover:text-white">
                 Sign out
               </button>
             </div>
           </div>
 
-          {/* Chat area */}
           <div className="flex h-[calc(100%-3.5rem)] flex-col">
             <div ref={scrollRef} className="chat-scroll flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-5 space-y-4">
               {messages.map((m, i) => {
                 const isUser = m.role === "user";
                 return (
-                  <div
-                    key={i}
-                    className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
-                      isUser
-                        ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
-                        : "mr-auto text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,.25)] border border-white/10 bg-white/8"
-                    }`}
-                  >
+                  <div key={i}
+                       className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
+                         isUser
+                           ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
+                           : "mr-auto text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,.25)] border border-white/10 bg-white/8"
+                       }`}>
                     <div className={`mb-1 text-[11px] ${isUser ? "text-slate-300" : "text-sky-300"}`}>
                       {isUser ? "You" : "AeonForge"}
                     </div>
@@ -278,7 +288,6 @@ export default function HomePage() {
               })}
             </div>
 
-            {/* Composer */}
             <div className="border-t border-white/10 bg-white/5 px-4 sm:px-6 lg:px-8 py-4">
               <div className="ml-auto flex w-full sm:w-[80%] md:w-[70%] lg:w-[60%] gap-2">
                 <textarea

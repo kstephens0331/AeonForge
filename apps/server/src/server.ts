@@ -1,4 +1,5 @@
-﻿import Fastify from "fastify";
+﻿// apps/server/src/server.ts
+import Fastify from "fastify";
 import cors from "@fastify/cors";
 
 import { verifySupabaseJwt } from "./auth.js";
@@ -11,7 +12,26 @@ import { SAFE_REPLY, moderateTextOrAllow } from "./moderation.js";
 
 const fastify = Fastify({ logger: true });
 
-/** CORS FIRST — allow localhost and any *.vercel.app (previews + prod) */
+/** ---------- SPEED TUNABLES ---------- */
+const RAG_TIMEOUT_MS = Number(process.env.RAG_TIMEOUT_MS ?? 500);     // cap retrieval time
+const BRIEF_MAX_WORDS = Number(process.env.BRIEF_MAX_WORDS ?? 120);   // keep answers short
+const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS ?? 10000); // keep connection hot
+
+function briefSystem() {
+  return `You are AeonForge.
+Answer directly and concisely. Prefer short, actionable replies under ~${BRIEF_MAX_WORDS} words.
+If you are unsure, say so briefly.`;
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    p.then(v => { clearTimeout(t); resolve(v); })
+     .catch(() => { clearTimeout(t); resolve(fallback); });
+  });
+}
+
+/** ---------- CORS FIRST ---------- */
 fastify.register(cors, {
   origin(origin, cb) {
     if (!origin) return cb(null, true); // curl/health checks
@@ -26,7 +46,7 @@ fastify.register(cors, {
 
 fastify.get("/healthz", async () => ({ ok: true }));
 
-/** Auth hook: skip preflights & healthz so CORS headers get set */
+/** ---------- AUTH HOOK (skip preflight + healthz) ---------- */
 fastify.addHook("preHandler", async (req, reply) => {
   if (req.method === "OPTIONS") return;
   if (req.url === "/healthz") return;
@@ -45,8 +65,7 @@ fastify.addHook("preHandler", async (req, reply) => {
   }
 });
 
-/** -------- Conversations -------- */
-
+/** ---------- Conversations ---------- */
 fastify.post<{ Body: { title?: string | null } }>("/conversations", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { title = null } = req.body ?? {};
@@ -70,8 +89,7 @@ fastify.get("/conversations", async (req, reply) => {
   return { conversations: (data ?? []) as ConversationRow[] };
 });
 
-/** -------- Messages -------- */
-
+/** ---------- Messages ---------- */
 fastify.get<{ Params: { id: string } }>("/conversations/:id/messages", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const convoId = req.params.id;
@@ -120,7 +138,7 @@ fastify.post<{
   return { message: data as MessageRow };
 });
 
-/** -------- RAG Ingest -------- */
+/** ---------- RAG Ingest ---------- */
 fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { text, filename } = req.body ?? {};
@@ -191,7 +209,7 @@ fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest"
   return { documentId: doc.id, filename: doc.filename, chunks: pieces.length, embedded: Boolean(embeddings) };
 });
 
-/** -------- Non-streaming Chat -------- */
+/** ---------- Non-streaming Chat (speed-optimized) ---------- */
 fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { conversationId, text } = req.body;
@@ -212,6 +230,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
     if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
   }
 
+  // Insert user message
   await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
 
   // Moderation (never dead-end)
@@ -224,11 +243,11 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
     return { conversationId: convId, text: SAFE_REPLY };
   }
 
-  // RAG context
-  const context = await retrieveContext(userId, q);
-  const system = context
-    ? `You are AeonForge. Use the CONTEXT below if relevant.\n\nCONTEXT:\n${context}\n\nIf not relevant, ignore.`
-    : `You are AeonForge. Answer clearly and concisely.`;
+  // ⚡️RAG with timeout
+  const ctx = await withTimeout(retrieveContext(userId, q), RAG_TIMEOUT_MS, "");
+  const system = ctx
+    ? `${briefSystem()}\n\nCONTEXT:\n${ctx}\n\nIgnore context if irrelevant.`
+    : briefSystem();
 
   const t0 = Date.now();
   const r = await routeGenerate(system, q);
@@ -238,8 +257,8 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
   await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: resultText });
 
   // Cost logging
-  let tokens_in = r.tokens_in ?? estimateTokensFromText(system) + estimateTokensFromText(q);
-  let tokens_out = r.tokens_out ?? estimateTokensFromText(resultText);
+  const tokens_in = r.tokens_in ?? estimateTokensFromText(system) + estimateTokensFromText(q);
+  const tokens_out = r.tokens_out ?? estimateTokensFromText(resultText);
   let cost_usd = 0;
 
   if (r.provider === "together" && r.model) {
@@ -262,15 +281,12 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat"
   return { conversationId: convId, text: resultText };
 });
 
-/** -------- Streaming Chat -------- */
+/** ---------- Streaming Chat (SSE + heartbeat + flush) ---------- */
 fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/stream", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
   const { conversationId, text } = req.body ?? {};
   const q = (text ?? "").trim();
-  if (!q) {
-    reply.code(400);
-    return { error: "Missing 'text'." };
-  }
+  if (!q) { reply.code(400); return { error: "Missing 'text'." }; }
 
   // Ensure conversation
   let convId = conversationId ?? null;
@@ -290,29 +306,44 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
   // Insert user message
   await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
 
-  // Moderation (block before opening stream)
+  // Moderation
   const verdict = await moderateTextOrAllow(q);
   if (verdict === "block") {
     await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: SAFE_REPLY });
     await admin.from("request_logs").insert({
       user_id: userId, model: "cloud", tokens_in: 0, tokens_out: 0, latency_ms: 0, success: true, cost_usd: 0
     });
-    return reply.send(SAFE_REPLY);
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    reply.raw.write(":ok\n\n");
+    reply.raw.write(`data: ${SAFE_REPLY}\n\n`);
+    try { reply.raw.end(); } catch {}
+    return;
   }
 
-  // Compose system with RAG
-  const context = await retrieveContext(userId, q);
-  const system = context
-    ? `You are AeonForge. Use the CONTEXT below if relevant.\n\nCONTEXT:\n${context}\n\nIf not relevant, ignore.`
-    : `You are AeonForge. Answer clearly and concisely.`;
+  // ⚡️RAG with timeout
+  const ctx = await withTimeout(retrieveContext(userId, q), RAG_TIMEOUT_MS, "");
+  const system = ctx
+    ? `${briefSystem()}\n\nCONTEXT:\n${ctx}\n\nIgnore context if irrelevant.`
+    : briefSystem();
 
-  // Prepare streaming response
+  // SSE headers + immediate flush
   reply.raw.writeHead(200, {
-    "Content-Type": "text/plain; charset=utf-8",
-    "Transfer-Encoding": "chunked",
+    "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
   });
+  reply.raw.write(":ok\n\n");
+
+  // Heartbeat to keep proxies from buffering
+  const heartbeat = setInterval(() => {
+    try { reply.raw.write(":hb\n\n"); } catch {}
+  }, SSE_HEARTBEAT_MS);
 
   // Abort handling
   const aborter = new AbortController();
@@ -333,12 +364,17 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
     for await (const delta of stream) {
       if (aborter.signal.aborted) break;
       accumulated += delta;
-      reply.raw.write(delta);
+      // send as SSE lines (keeps first token snappy)
+      const safe = String(delta).replace(/\r?\n/g, "\n");
+      for (const line of safe.split("\n")) {
+        reply.raw.write(`data: ${line}\n\n`);
+      }
     }
     success = true;
   } catch {
     // swallow; client may have aborted
   } finally {
+    clearInterval(heartbeat);
     try { reply.raw.end(); } catch {}
     reply.raw.off("close", onClose);
     reply.raw.off("error", onClose);
@@ -353,7 +389,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string } }>("/chat/
     });
   }
 
-  // Estimated cost logging for streaming
+  // Estimated cost logging
   const tokens_in = estimateTokensFromText(system) + estimateTokensFromText(q);
   const tokens_out = estimateTokensFromText(accumulated);
   let cost_usd = 0;
