@@ -5,6 +5,8 @@ import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { apiFetch } from "@/lib/api";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787";
+
 type Role = "user" | "assistant" | "system";
 type ChatMessage = { role: Role; content: string; created_at?: string; id?: string };
 type Conversation = { id: string; title: string | null; created_at: string };
@@ -15,14 +17,14 @@ function StatusPillInline() {
 
   useEffect(() => {
     let cancelled = false;
-    async function ping() {
-      try {
-        const res = await fetch("http://localhost:8787/healthz", { cache: "no-store" });
-        if (!cancelled) setStatus(res.ok ? "online" : "offline");
-      } catch {
-        if (!cancelled) setStatus("offline");
-      }
-    }
+async function ping() {
+  try {
+    const res = await fetch(`${API_URL}/healthz`, { cache: "no-store" });
+    if (!cancelled) setStatus(res.ok ? "online" : "offline");
+  } catch {
+    if (!cancelled) setStatus("offline");
+  }
+}
     ping();
     const id = setInterval(ping, 30_000);
     return () => {
@@ -137,12 +139,12 @@ export default function HomePage() {
     setAborter(controller);
 
     try {
-      const res = await fetch("http://localhost:8787/chat/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ conversationId, text }),
-        signal: controller.signal,
-      });
+const res = await fetch(`${API_URL}/chat/stream`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ conversationId, text }),
+  signal: controller.signal,
+});
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
       // (Optional) If you later send X-Conversation-Id from server, pick it up here
