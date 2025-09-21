@@ -7,5 +7,12 @@
     "dev:server": "pnpm --filter @aeonforge/server dev",
     "dev": "echo \"Open two terminals: pnpm dev:server and pnpm dev:web\"",
     "build": "pnpm -r build"
+  },
+"pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "unrs-resolver"
+    ]
   }
 }
