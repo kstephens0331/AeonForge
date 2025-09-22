@@ -1,32 +1,31 @@
+// apps/web/src/app/api/chat/route.ts
+import { getServerUrl } from "@/lib/serverUrl";
+import { jsonProxy } from "@/lib/jsonProxy";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const API_BASE =
-  process.env.AEONFORGE_SERVER_URL ??
-  process.env.NEXT_PUBLIC_API_BASE ??
-  "http://localhost:8787";
+type ChatBody = {
+  conversationId?: string | null;
+  text: string;
+  targetWords?: number | null;
+};
 
-export async function POST(req: Request) {
-  const auth = req.headers.get("authorization") ?? "";
-  const body = await req.json().catch(() => ({}));
+export async function POST(req: Request): Promise<Response> {
+  const server = getServerUrl();
 
-  const upstream = await fetch(`${API_BASE}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: auth },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
+  let body: ChatBody;
+  try {
+    body = (await req.json()) as ChatBody;
+  } catch {
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
 
-  const text = await upstream.text().catch(() => "");
-  return new Response(text, {
-    status: upstream.status,
-    headers: {
-      "Content-Type": upstream.headers.get("content-type") ?? "application/json",
-      "Cache-Control": "no-cache, no-transform",
-    },
-  });
-}
+  const auth = req.headers.get("authorization");
+  const headers: HeadersInit = {
+    "Content-Type": "application/json",
+    ...(auth ? { Authorization: auth } : {}),
+  };
 
-export function OPTIONS() {
-  return new Response(null, { status: 204 });
+  return jsonProxy(`${server}/chat`, { method: "POST", headers, body: JSON.stringify(body) });
 }
