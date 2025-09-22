@@ -5,5 +5,5 @@
     "noEmit": false
   },
   "include": ["**/*"],
-  "exclude": ["node_modules"]
+  "exclude": ["**/.next/**", "node_modules", "dist", "build", "out"]
 }

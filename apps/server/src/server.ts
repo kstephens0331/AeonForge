@@ -126,7 +126,7 @@ async function* togetherStream(messages: any[], { signal }: { signal?: AbortSign
         const s = line.trim();
         if (!s || s.startsWith(":")) continue;
         if (!s.startsWith("data:")) continue;
-        const payload = s.slice(5).trim();
+        const payload = line.slice(5);
         if (!payload || payload === "[DONE]") continue;
         try {
           const j = JSON.parse(payload);

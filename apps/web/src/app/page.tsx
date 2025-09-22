@@ -17,9 +17,7 @@ function StatusPillInline() {
       try {
         const res = await fetch("/api/healthz", { cache: "no-store" });
         if (!cancelled) setStatus(res.ok ? "online" : "offline");
-      } catch {
-        if (!cancelled) setStatus("offline");
-      }
+      } catch { if (!cancelled) setStatus("offline"); }
     }
     ping();
     const id = setInterval(ping, 30_000);
@@ -84,9 +82,7 @@ export default function HomePage() {
         const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${cid}/messages`, token);
         setMessages(list.messages);
         setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 0);
-      } catch (e) {
-        console.error(e);
-      }
+      } catch (e) { console.error(e); }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
@@ -111,9 +107,9 @@ export default function HomePage() {
   }
 
   function appendAssistant(text: string) {
+    if (!text) return;
     setMessages((prev) => {
       const copy = [...prev];
-      // ensure assistant exists
       if (!copy.length || copy[copy.length - 1].role !== "assistant") {
         copy.push({ role: "assistant", content: "" });
       }
@@ -123,7 +119,6 @@ export default function HomePage() {
   }
 
   function detectRequestedWords(s: string): number | null {
-    // catch "4000 words", "4k words", "4,000 word"
     const k = s.match(/(\d+(?:[\.,]\d+)?)\s*k\s*words?/i);
     if (k) {
       const n = Math.round(parseFloat(k[1].replace(",", ".")) * 1000);
@@ -163,7 +158,6 @@ export default function HomePage() {
     const text = input.trim();
     if (!text || !token || loading) return;
 
-    // only the user bubble up front
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
     requestAnimationFrame(() => autoSize());
@@ -193,11 +187,8 @@ export default function HomePage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      // 2s “no first byte” cutoff → fallback
       firstDataTimer = setTimeout(() => {
-        if (!gotFirstData && !controller.signal.aborted) {
-          controller.abort();
-        }
+        if (!gotFirstData && !controller.signal.aborted) controller.abort();
       }, 2000);
 
       function processSSE(chunkText: string) {
@@ -210,27 +201,25 @@ export default function HomePage() {
           const block = buffer.slice(0, sep);
           buffer = buffer.slice(sep + 2);
 
-          let evt: string | null = null;
-          const dataParts: string[] = [];
+          let event: string | null = null;
+          const datas: string[] = [];
 
           for (const raw of block.split("\n")) {
-            const line = raw.trimEnd();
-            if (!line) continue;
-            if (line.startsWith(":")) continue;                 // comments :ok / :hb
-            if (line.startsWith("event:")) { evt = line.slice(6).trim(); continue; }
-            if (line.startsWith("data:")) { dataParts.push(line.slice(5)); continue; }
+            if (!raw) continue;
+            if (raw.startsWith(":")) continue;
+            if (raw.startsWith("event:")) { event = raw.slice(6).trim(); continue; }
+            if (raw.startsWith("data:")) { datas.push(raw.slice(5)); continue; } // keep leading spaces
           }
 
-          const data = dataParts.join("\n").replace(/^\s+/, "");
-
-          if (evt === "status") {
-            setMiniStatus(data); // retrieving/generating/done/segment-*/complete
+          const dataJoined = datas.join("\n");
+          if (event === "status") {
+            setMiniStatus(dataJoined.trim());
             continue;
           }
 
-          if (data) {
-            if (!gotFirstData) pushAssistantIfNeeded(); // create assistant block on first real data
-            const cleaned = data.replace(/<think>[\s\S]*?<\/think>/g, "");
+          if (dataJoined) {
+            if (!gotFirstData) pushAssistantIfNeeded();
+            const cleaned = dataJoined.replace(/<think>[\s\S]*?<\/think>/g, "");
             if (cleaned) {
               appendAssistant(cleaned);
               gotFirstData = true;
@@ -247,11 +236,9 @@ export default function HomePage() {
         if (done) break;
         if (value) {
           const chunk = decoder.decode(value, { stream: true });
-          if (chunk.includes("data:") || chunk.startsWith(":")) {
+          if (chunk.includes("data:") || chunk.includes("\n\n") || chunk.startsWith(":") || chunk.startsWith("event:")) {
             const changed = processSSE(chunk);
-            if (changed) {
-              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-            }
+            if (changed) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
           } else {
             if (!gotFirstData) pushAssistantIfNeeded();
             const cleaned = chunk.replace(/<think>[\s\S]*?<\/think>/g, "");
@@ -273,14 +260,11 @@ export default function HomePage() {
       setAborter(null);
       setMiniStatus("done");
 
-      // If nothing ever arrived, fallback now
       setTimeout(() => {
         setMiniStatus("");
         setMessages((prev) => {
           const last = prev[prev.length - 1];
-          if (!last || last.role !== "assistant") {
-            void fallbackNonStreaming(text, targetWords);
-          }
+          if (!last || last.role !== "assistant") void fallbackNonStreaming(text, targetWords);
           return prev;
         });
       }, 600);
