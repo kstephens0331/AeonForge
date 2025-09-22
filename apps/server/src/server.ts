@@ -18,11 +18,8 @@ const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS ?? 10000);
 const TOGETHER_API_KEY = process.env.TOGETHER_API_KEY!;
 const TOGETHER_MODEL = process.env.TOGETHER_MODEL ?? "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo";
 
-// long-form segmentation (per-segment goals)
 const LONGFORM_SEGMENT_WORDS = Number(process.env.LONGFORM_SEGMENT_WORDS ?? 1200);
-// generous token cap per segment; API requires some numeric limit anyway
 const SEGMENT_MAX_TOKENS = Number(process.env.SEGMENT_MAX_TOKENS ?? 4096);
-// absolute per-segment deadline (keeps first token fast; overall can be longer for longform)
 const SEGMENT_DEADLINE_MS = Number(process.env.SEGMENT_DEADLINE_MS ?? 25_000);
 
 if (!TOGETHER_API_KEY) {
@@ -132,8 +129,7 @@ async function* togetherStream(messages: any[], { signal }: { signal?: AbortSign
           const j = JSON.parse(payload);
           const piece =
             j?.choices?.[0]?.delta?.content ??
-            j?.choices?.[0]?.text ??
-            "";
+            j?.choices?.[0]?.text ?? "";
           if (piece) yield stripThink(piece);
         } catch {}
       }
@@ -254,104 +250,103 @@ async function safeRetrieveContext(userId: string, q: string) {
   return await withTimeout(retrieveContext(userId, q), RAG_TIMEOUT_MS, "");
 }
 
-/** ---------- Non-streaming Chat (Together only) ---------- */
-fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords?: number | null } }>(
+/** ---------- Non-streaming Chat (Together-only, hardened) ---------- */
+fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords?: number } }>(
   "/chat",
   async (req, reply) => {
     const userId = (req as any).user?.sub as string;
-    const { conversationId, text, targetWords } = req.body;
-    const q = text?.trim() ?? "";
+    const { conversationId, text, targetWords } = req.body ?? {};
+    const q = (text ?? "").trim();
 
-    // Ensure conversation
+    // conversation bootstrap (best-effort)
     let convId = conversationId ?? null;
-    if (!convId) {
-      const { data: newConv, error: convErr } = await admin
-        .from("conversations")
-        .insert({ user_id: userId, title: q.slice(0, 60) })
-        .select()
-        .single();
-      if (convErr || !newConv) return reply.code(500).send({ error: convErr?.message ?? "conv create failed" });
-      convId = newConv.id;
-    } else {
-      const { data: c, error: ce } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
-      if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
+    try {
+      if (!convId) {
+        const { data: newConv } = await admin
+          .from("conversations")
+          .insert({ user_id: userId, title: q.slice(0, 60) || "New chat" })
+          .select()
+          .single();
+        if (newConv) convId = newConv.id;
+      } else {
+        const { data: c } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
+        if (!c || c.user_id !== userId) convId = null;
+      }
+    } catch {}
+
+    // log user message (best-effort)
+    try { await admin.from("messages").insert({ conversation_id: convId ?? null, role: "user", content: q }); } catch {}
+
+    // moderation (best-effort allow)
+    let blocked = false;
+    try { blocked = (await moderateTextOrAllow(q)) === "block"; } catch {}
+    if (blocked) {
+      const safe = SAFE_REPLY;
+      try { await admin.from("messages").insert({ conversation_id: convId ?? null, role: "assistant", content: safe }); } catch {}
+      try {
+        await admin.from("request_logs").insert({
+          user_id: userId, model: "cloud", tokens_in: 0, tokens_out: 0, latency_ms: 0, success: true, cost_usd: 0
+        });
+      } catch {}
+      return { conversationId: convId, text: safe };
     }
 
-    await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
-
-    const verdict = await moderateTextOrAllow(q);
-    if (verdict === "block") {
-      await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: SAFE_REPLY });
-      await admin.from("request_logs").insert({
-        user_id: userId, model: "cloud", tokens_in: 0, tokens_out: 0, latency_ms: 0, success: true, cost_usd: 0
-      });
-      return { conversationId: convId, text: SAFE_REPLY };
-    }
-
-    const ctx = await safeRetrieveContext(userId, q);
-    const system = ctx
-      ? `${briefSystem()}\n\nCONTEXT:\n${ctx}\n\nIgnore context if irrelevant.`
+    // RAG (best-effort)
+    const context = await safeRetrieveContext(userId, q);
+    const system = context
+      ? `${briefSystem()}\n\nCONTEXT:\n${context}\n\nIgnore context if irrelevant.`
       : briefSystem();
 
-    // Build messages; if longform requested, nudge length up front
-    const wantWords = typeof targetWords === "number" && targetWords > 0 ? Math.min(targetWords, 20000) : 0;
-    const userPrompt = wantWords
-      ? `${q}\n\nPlease write approximately ${wantWords} words of cohesive, high-quality prose. Avoid filler and repetition.`
-      : q;
-
-    const { signal, cancel } = abortAfter(SEGMENT_DEADLINE_MS);
+    // Together call (no router)
     const t0 = Date.now();
-    let textOut = "";
-    let tokens_in = estimateTokensFromText(system) + estimateTokensFromText(userPrompt);
+    let resultText = "Sorry—no response was generated.";
+    let tokens_in = estimateTokensFromText(system) + estimateTokensFromText(q);
     let tokens_out = 0;
 
     try {
-      const r = await togetherOnce(
+      const promptUser = targetWords
+        ? `${q}\n\n(If applicable, write approximately ${Math.min(targetWords, 20000)} words without filler or repetition.)`
+        : q;
+
+      const { text: out, usage } = await togetherOnce(
         [
           { role: "system", content: system },
-          { role: "user", content: userPrompt },
-        ],
-        { signal }
+          { role: "user", content: promptUser },
+        ]
       );
-      textOut = r.text;
-      const usage = r.usage || {};
-      if (usage.prompt_tokens && usage.completion_tokens) {
-        tokens_in = usage.prompt_tokens;
-        tokens_out = usage.completion_tokens;
+      resultText = out || resultText;
+      if (usage) {
+        tokens_in = usage.prompt_tokens ?? tokens_in;
+        tokens_out = usage.completion_tokens ?? estimateTokensFromText(resultText);
       } else {
-        tokens_out = estimateTokensFromText(textOut);
+        tokens_out = estimateTokensFromText(resultText);
       }
-    } catch (e) {
-      fastify.log.error(e);
-      textOut = "Sorry — I couldn’t complete that just now.";
-      tokens_out = estimateTokensFromText(textOut);
-    } finally {
-      cancel();
+    } catch (e: any) {
+      resultText = `Sorry—upstream error: ${e?.message || e}`;
     }
 
-    await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: textOut });
+    try { await admin.from("messages").insert({ conversation_id: convId ?? null, role: "assistant", content: resultText }); } catch {}
 
-    let cost_usd = 0;
+    // cost logging (best-effort)
     try {
       const p = await getTogetherPricePerToken(TOGETHER_MODEL);
-      cost_usd = costFromTokens(tokens_in, tokens_out, p);
+      const cost_usd = costFromTokens(tokens_in, tokens_out, p);
+      await admin.from("request_logs").insert({
+        user_id: userId,
+        model: "cloud",
+        tokens_in, tokens_out,
+        latency_ms: Date.now() - t0,
+        success: true,
+        cost_usd,
+      });
     } catch {}
 
-    await admin.from("request_logs").insert({
-      user_id: userId,
-      model: "cloud",
-      tokens_in,
-      tokens_out,
-      latency_ms: Date.now() - t0,
-      success: true,
-      cost_usd,
-    });
-
-    return { conversationId: convId, text: textOut };
+    return { conversationId: convId, text: resultText };
   }
 );
 
 /** ---------- Streaming Chat (Together + long-form segmentation) ---------- */
+/* KEEP ONLY THIS ONE streaming route */
 fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords?: number | null } }>(
   "/chat/stream",
   async (req, reply) => {
@@ -362,35 +357,32 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
 
     // Ensure conversation
     let convId = conversationId ?? null;
-    if (!convId) {
-      const { data: newConv, error: convErr } = await admin
-        .from("conversations")
-        .insert({ user_id: userId, title: q.slice(0, 60) })
-        .select()
-        .single();
-      if (convErr || !newConv) return reply.code(500).send({ error: convErr?.message ?? "conv create failed" });
-      convId = newConv.id;
-    } else {
-      const { data: c, error: ce } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
-      if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
-    }
+    try {
+      if (!convId) {
+        const { data: newConv } = await admin
+          .from("conversations")
+          .insert({ user_id: userId, title: q.slice(0, 60) })
+          .select()
+          .single();
+        if (newConv) convId = newConv.id;
+      } else {
+        const { data: c } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
+        if (!c || c.user_id !== userId) convId = null;
+      }
+    } catch {}
 
-    await admin.from("messages").insert({ conversation_id: convId, role: "user", content: q });
+    try { await admin.from("messages").insert({ conversation_id: convId ?? null, role: "user", content: q }); } catch {}
 
-    const verdict = await moderateTextOrAllow(q);
-    if (verdict === "block") {
-      await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: SAFE_REPLY });
-      await admin.from("request_logs").insert({
-        user_id: userId, model: "cloud", tokens_in: 0, tokens_out: 0, latency_ms: 0, success: true, cost_usd: 0
-      });
+    let blocked = false;
+    try { blocked = (await moderateTextOrAllow(q)) === "block"; } catch {}
+    if (blocked) {
       reply.raw.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
+        Connection: "keep-alive",
         "X-Accel-Buffering": "no",
       });
-      reply.raw.write(":ok\n\n");
-      reply.raw.write("event: status\ndata: done\n\n");
+      reply.raw.write(`event: status\ndata: blocked\n\n`);
       reply.raw.write(`data: ${SAFE_REPLY}\n\n`);
       try { reply.raw.end(); } catch {}
       return;
@@ -400,7 +392,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
+      Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     });
     reply.raw.write(":ok\n\n");
@@ -423,7 +415,6 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
     let written = 0;
     let segmentIndex = 0;
 
-    // Build first user prompt (if longform, ask for segment-sized chunk)
     const firstChunkWords = wantWords ? Math.min(LONGFORM_SEGMENT_WORDS, wantWords) : 0;
 
     async function streamOnePrompt(prompt: string, system = baseSystem, parentAbort?: AbortSignal) {
@@ -450,7 +441,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
     }
 
     try {
-      // First segment (short Q&A or first longform chunk)
+      // First segment
       const firstPrompt = firstChunkWords
         ? `${q}\n\nPlease write ~${firstChunkWords} words of cohesive, high-quality prose. Avoid filler and repetition.`
         : q;
@@ -485,7 +476,7 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
 
     const finalText = accumulated.trim();
     if (finalText) {
-      await admin.from("messages").insert({ conversation_id: convId!, role: "assistant", content: finalText });
+      try { await admin.from("messages").insert({ conversation_id: convId ?? null, role: "assistant", content: finalText }); } catch {}
     }
 
     // Log (estimate for streaming)
@@ -495,17 +486,16 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
     try {
       const p = await getTogetherPricePerToken(TOGETHER_MODEL);
       cost_usd = costFromTokens(tokens_in, tokens_out, p);
+      await admin.from("request_logs").insert({
+        user_id: userId,
+        model: "cloud",
+        tokens_in,
+        tokens_out,
+        latency_ms: Math.max(1, Math.round(tokens_out / 3)),
+        success: true,
+        cost_usd,
+      });
     } catch {}
-
-    await admin.from("request_logs").insert({
-      user_id: userId,
-      model: "cloud",
-      tokens_in,
-      tokens_out,
-      latency_ms: Math.max(1, Math.round(tokens_out / 3)), // coarse placeholder
-      success: true,
-      cost_usd,
-    });
 
     return;
   }
