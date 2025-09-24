@@ -1,74 +1,63 @@
 ﻿"use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { supabase } from "@/lib/supabaseClient";
 import { apiFetch } from "@/lib/api";
+import { Plus } from "lucide-react";
 
-type Role = "user" | "assistant" | "system";
-type ChatMessage = { role: Role; content: string; created_at?: string; id?: string };
-type Conversation = { id: string; title: string | null; created_at: string };
+type Role = "user" | "assistant";
+type ChatMessage = { role: Role; content: string };
 
-function StatusPillInline() {
-  const [status, setStatus] = useState<"checking" | "online" | "offline">("checking");
+type Conversation = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at?: string | null;
+  mode?: "code" | "studying" | "project" | "general";
+};
+
+function useAuthToken() {
+  const [token, setToken] = useState<string | null>(null);
   useEffect(() => {
-    let cancelled = false;
-    async function ping() {
-      try {
-        const res = await fetch("/api/healthz", { cache: "no-store" });
-        if (!cancelled) setStatus(res.ok ? "online" : "offline");
-      } catch { if (!cancelled) setStatus("offline"); }
-    }
-    ping();
-    const id = setInterval(ping, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
+    const t = typeof window !== "undefined" ? localStorage.getItem("af_token") : null;
+    setToken(t || "");
   }, []);
-  const color = status === "online" ? "bg-emerald-400" : status === "offline" ? "bg-rose-400" : "bg-slate-400";
-  const label = status === "online" ? "API online" : status === "offline" ? "API offline" : "Checking…";
-  return (
-    <div className="fixed left-3 bottom-3 z-50 flex items-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 backdrop-blur-xl">
-      <span className={`inline-block h-2 w-2 rounded-full ${color}`} />
-      <span>{label}</span>
-    </div>
-  );
+  return token;
 }
 
-export default function HomePage() {
-  const [email, setEmail] = useState<string | null>(null);
-  const [token, setToken] = useState<string | null>(null);
-
+export default function ChatPage() {
+  const token = useAuthToken();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [miniStatus, setMiniStatus] = useState("");
   const [aborter, setAborter] = useState<AbortController | null>(null);
-  const [miniStatus, setMiniStatus] = useState<string>("");
+  const [convos, setConvos] = useState<Conversation[]>([]);
+  const [newMode, setNewMode] = useState<Conversation["mode"]>("code");
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Load conversations into sidebar
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setEmail(data.session?.user?.email ?? null);
-      setToken(data.session?.access_token ?? null);
-    });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-      setEmail(s?.user?.email ?? null);
-      setToken(s?.access_token ?? null);
-    });
-    return () => sub.subscription.unsubscribe();
-  }, []);
+    (async () => {
+      if (!token) return;
+      try {
+        const list = await apiFetch<{ conversations: Conversation[] }>("/conversations", token);
+        setConvos(list.conversations || []);
+      } catch (e) {
+        console.error(e);
+      }
+    })();
+  }, [token]);
 
-  useEffect(() => {
-    const cid = localStorage.getItem("af_conversation_id");
-    if (cid) setConversationId(cid);
-  }, []);
-
+  // Ensure we have a current conversation and fetch its messages
   useEffect(() => {
     if (!token) return;
     (async () => {
       try {
-        let cid = conversationId;
+        let cid = typeof window !== "undefined" ? localStorage.getItem("af_conversation_id") : null;
         if (!cid) {
           const res = await apiFetch<{ conversation: Conversation }>(
             "/conversations",
@@ -76,17 +65,20 @@ export default function HomePage() {
             { method: "POST", body: JSON.stringify({ title: "New chat" }) }
           );
           cid = res.conversation.id;
-          setConversationId(cid);
           localStorage.setItem("af_conversation_id", cid);
         }
+        setConversationId(cid!);
+
         const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${cid}/messages`, token);
         setMessages(list.messages);
         setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 0);
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+      }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
+  // Auto-size input
   const autoSize = () => {
     const el = textareaRef.current; if (!el) return;
     const line = 24, max = line * 6;
@@ -99,9 +91,7 @@ export default function HomePage() {
   function pushAssistantIfNeeded() {
     setMessages((prev) => {
       const last = prev[prev.length - 1];
-      if (!last || last.role !== "assistant") {
-        return [...prev, { role: "assistant", content: "" }];
-      }
+      if (!last || last.role !== "assistant") return [...prev, { role: "assistant", content: "" }];
       return prev;
     });
   }
@@ -180,6 +170,7 @@ export default function HomePage() {
         body: JSON.stringify({ conversationId, text, targetWords }),
         signal: controller.signal,
       });
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       if (!res.body) throw new Error("No response body");
 
@@ -208,7 +199,7 @@ export default function HomePage() {
             if (!raw) continue;
             if (raw.startsWith(":")) continue;
             if (raw.startsWith("event:")) { event = raw.slice(6).trim(); continue; }
-            if (raw.startsWith("data:")) { datas.push(raw.slice(5)); continue; } // keep leading spaces
+            if (raw.startsWith("data:")) { datas.push(raw.slice(5)); continue; }
           }
 
           const dataJoined = datas.join("\n");
@@ -249,7 +240,7 @@ export default function HomePage() {
           }
         }
       }
-    } catch (err: unknown) {
+    } catch (err) {
       const aborted =
         (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
         (err instanceof Error && err.name === "AbortError");
@@ -259,15 +250,7 @@ export default function HomePage() {
       setLoading(false);
       setAborter(null);
       setMiniStatus("done");
-
-      setTimeout(() => {
-        setMiniStatus("");
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (!last || last.role !== "assistant") void fallbackNonStreaming(text, targetWords);
-          return prev;
-        });
-      }, 600);
+      setTimeout(() => setMiniStatus(""), 600);
     }
   }
 
@@ -280,122 +263,140 @@ export default function HomePage() {
     }
   }
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      if (loading) { e.preventDefault(); return; }
-      e.preventDefault();
-      void sendMessage();
+  async function startNewChat() {
+    if (!token) return;
+    try {
+      const res = await apiFetch<{ conversation: Conversation }>(
+        "/conversations",
+        token,
+        { method: "POST", body: JSON.stringify({ title: `${newMode ?? "code"} chat`, mode: newMode ?? "code" }) }
+      );
+      const cid = res.conversation.id;
+      localStorage.setItem("af_conversation_id", cid);
+      setConversationId(cid);
+      const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${cid}/messages`, token);
+      setMessages(list.messages);
+      const convosList = await apiFetch<{ conversations: Conversation[] }>("/conversations", token);
+      setConvos(convosList.conversations || []);
+    } catch (e) {
+      console.error(e);
     }
   }
 
-  if (!email) {
-    return (
-      <main className="h-screen w-screen flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <h1 className="text-2xl font-semibold">AeonForge</h1>
-          <p className="text-slate-300">Please sign in to continue.</p>
-          <Link href="/login" className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition">
-            Sign in
-          </Link>
-        </div>
-      </main>
-    );
+  async function switchConversation(id: string) {
+    if (!token) return;
+    try {
+      localStorage.setItem("af_conversation_id", id);
+      setConversationId(id);
+      const list = await apiFetch<{ messages: ChatMessage[] }>(`/conversations/${id}/messages`, token);
+      setMessages(list.messages);
+      setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 0);
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   return (
     <main className="h-screen w-screen">
-      <StatusPillInline />
-      <div className="h-full w-full px-4 md:px-6 lg:px-10 py-6">
-        <div className="mx-auto h-full max-w-6xl rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-[0_20px_120px_rgba(0,0,0,.35)] overflow-hidden">
-          <div className="flex items-center justify-between border-b border-white/10 bg-white/5 px-5 sm:px-8 py-4">
-            <div className="flex items-center gap-3">
-              <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-sky-400 to-teal-300 shadow-[0_6px_20px_rgba(56,189,248,.35)]" />
-              <div>
-                <h1 className="text-sm sm:text-base font-semibold text-white">AeonForge</h1>
-                <p className="text-[11px] sm:text-xs text-slate-300/80">{email}</p>
-              </div>
-            </div>
-            <div className="flex items-center gap-3">
-              {miniStatus && (
-                <div className="hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100">
-                  <span className="h-1.5 w-1.5 rounded-full bg-sky-300" />
-                  <span>{miniStatus}</span>
-                </div>
-              )}
-              {loading && (
-                <div className="flex items-center gap-2">
-                  <div className="hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100">
-                    <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-300 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-300"></span>
-                    </span>
-                    <span>Thinking…</span>
-                  </div>
-                  <button
-                    onClick={stopRequest}
-                    className="rounded-xl border border-white/10 bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20 transition"
-                    aria-label="Stop generating"
-                    title="Stop"
-                  >
-                    Stop
-                  </button>
-                </div>
-              )}
-              <button
-                onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem("af_conversation_id"); }}
-                className="text-xs text-slate-300/80 hover:text-white"
-              >
-                Sign out
-              </button>
-            </div>
+      <div className="grid grid-cols-[18rem_1fr] h-full">
+        {/* Sidebar */}
+        <aside className="h-full border-r overflow-hidden flex flex-col">
+          <div className="px-3 py-2 flex items-center justify-between">
+            <span className="text-xs uppercase text-gray-500">Conversations</span>
+            <button
+              className="rounded-xl border px-2 py-1 text-sm"
+              onClick={startNewChat}
+              title="Create new chat"
+            >
+              <Plus className="inline-block w-4 h-4" />
+            </button>
           </div>
 
-          <div className="flex h-[calc(100%-3.5rem)] flex-col">
-            <div ref={scrollRef} className="chat-scroll flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-5 space-y-4">
-              {messages.map((m, i) => {
-                const isUser = m.role === "user";
-                return (
-                  <div
-                    key={i}
-                    className={`max-w-[86%] md:max-w-[70%] px-4 py-3 rounded-2xl leading-relaxed ${
-                      isUser
-                        ? "ml-auto text-white shadow-[0_10px_30px_rgba(2,6,23,.35)] border border-white/10 bg-gradient-to-br from-slate-900 to-slate-800"
-                        : "mr-auto text-slate-100 border border-white/10 bg-transparent shadow-none"
-                    }`}
-                  >
-                    <div className={`mb-1 text-[11px] ${isUser ? "text-slate-300" : "text-sky-300"}`}>
-                      {isUser ? "You" : "AeonForge"}
-                    </div>
-                    <div className="whitespace-pre-wrap">{m.content}</div>
-                  </div>
-                );
-              })}
-            </div>
+          <div className="px-3 py-2">
+            <label className="text-xs uppercase text-gray-500 block mb-1">New chat mode</label>
+            <select
+              className="w-full rounded-xl border px-2 py-1"
+              value={newMode}
+              onChange={(e) => setNewMode(e.target.value as any)}
+            >
+              <option value="code">Code</option>
+              <option value="studying">Studying</option>
+              <option value="project">Project</option>
+              <option value="general">General</option>
+            </select>
+          </div>
 
-            <div className="border-t border-white/10 bg-white/5 px-4 sm:px-6 lg:px-8 py-4">
-              <div className="ml-auto flex w-full sm:w-[80%] md:w-[70%] lg:w-[60%] gap-2">
-                <textarea
-                  ref={textareaRef}
-                  value={input}
-                  onChange={(e) => { setInput(e.target.value); autoSize(); }}
-                  onKeyDown={onKeyDown}
-                  rows={1}
-                  className="flex-1 rounded-2xl px-4 py-2.5 bg-white/10 text-slate-100 placeholder:text-slate-400/70 border border-white/10 outline-none focus:ring-2 focus:ring-sky-300/40 focus:border-white/20 resize-none leading-6 overflow-hidden"
-                  placeholder="Type a message (Shift+Enter for newline)…"
-                />
-                <button
-                  className="px-4 py-2.5 rounded-2xl text-slate-900 bg-sky-300 hover:bg-sky-200 active:bg-sky-300 transition shadow-[0_10px_30px_rgba(56,189,248,.35)] disabled:opacity-60"
-                  disabled={loading || !input.trim()}
-                  aria-busy={loading}
-                  onClick={() => void sendMessage()}
-                >
-                  Send
-                </button>
+          <div className="flex-1 overflow-y-auto px-2 pb-3 space-y-1">
+            {convos.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => switchConversation(c.id)}
+                className={`w-full text-left truncate rounded-xl px-2 py-1 hover:bg-gray-100 ${conversationId === c.id ? "bg-gray-100" : ""}`}
+              >
+                <div className="text-sm">{c.title || "(untitled)"}</div>
+                <div className="text-xs text-gray-500">{c.mode ? `[${c.mode}]` : ""}</div>
+              </button>
+            ))}
+            {convos.length === 0 && (
+              <div className="text-xs text-gray-500 px-2 py-2">No conversations yet.</div>
+            )}
+          </div>
+        </aside>
+
+        {/* Chat window */}
+        <section className="h-full flex flex-col">
+          <div className="border-b px-4 py-2 text-sm text-gray-600">
+            {miniStatus ? `Status: ${miniStatus}` : ""}
+          </div>
+
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-3">
+            {messages.map((m, i) => (
+              <div key={i} className={`max-w-3xl ${m.role === "user" ? "ml-auto text-right" : ""}`}>
+                <div className={`inline-block rounded-2xl border px-4 py-2 ${m.role === "user" ? "bg-white" : "bg-gray-50"}`}>
+                  <div className="text-xs text-gray-500 mb-1">{m.role}</div>
+                  <div className="whitespace-pre-wrap text-sm">{m.content}</div>
+                </div>
               </div>
-            </div>
+            ))}
+          </div>
+
+          <div className="border-t p-3 flex gap-2">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onInput={autoSize}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!loading) void sendMessage();
+                }
+              }}
+              placeholder="Type your message… (e.g., 'write 1.2k words on …')"
+              className="flex-1 rounded-2xl border px-4 py-3 resize-none leading-6"
+              rows={1}
+            />
+            <button
+              onClick={loading ? stopRequest : sendMessage}
+              className="rounded-2xl border px-4 py-3 min-w-24"
+            >
+              {loading ? "Stop" : "Send"}
+            </button>
+          </div>
+        </section>
+      </div>
+
+      {!token && (
+        <div className="absolute inset-0 bg-white/70 backdrop-blur-sm flex items-center justify-center">
+          <div className="text-center space-y-4">
+            <h1 className="text-2xl font-semibold">AeonForge</h1>
+            <p className="text-slate-600">Please sign in to continue.</p>
+            <Link href="/login" className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition">
+              Sign in
+            </Link>
           </div>
         </div>
-      </div>
+      )}
     </main>
   );
 }
