@@ -1,77 +1,96 @@
+// apps/server/src/rag.ts
+// Minimal text-ingest + chunk + (optional) embed + persist to Supabase.
+
 import { admin } from "./db.js";
-import { CFG } from "./config.js";
 import { togetherEmbed } from "./models/together.js";
-import { ollamaEmbed } from "./models/ollama.js";
 
-/** Simple char-length chunker ~800 tokens (~3200 chars) with small overlap */
-export function chunkText(raw: string, targetChars = 3200, overlap = 300): string[] {
-  const text = (raw ?? "").replace(/\r\n/g, "\n").trim();
-  if (!text) return [];
-  const chunks: string[] = [];
-  let i = 0;
-  while (i < text.length) {
-    const end = Math.min(text.length, i + targetChars);
-    chunks.push(text.slice(i, end));
-    i = end - overlap;
-    if (i < 0) i = 0;
-    if (i >= text.length) break;
+/** Simple paragraph/sentence-based chunking */
+function chunkText(s: string, target = 700): string[] {
+  const paragraphs = s.replace(/\r\n/g, "\n").trim().split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  const out: string[] = [];
+  let buf = "";
+  const flush = () => { const b = buf.trim(); if (b) out.push(b); buf = ""; };
+  const push = (piece: string) => {
+    if ((buf + " " + piece).trim().length > target) { flush(); buf = piece; } else { buf = (buf ? buf + " " : "") + piece; }
+  };
+  for (const p of paragraphs) {
+    if (p.length <= target) { push(p); continue; }
+    for (const snt of p.split(/(?<=[\.\!\?])\s+/)) {
+      if (snt.length <= target) { push(snt); }
+      else {
+        let cur = "";
+        for (const w of snt.split(/\s+/)) {
+          if ((cur + " " + w).trim().length > target) { push(cur); cur = w; } else { cur = (cur ? cur + " " : "") + w; }
+        }
+        if (cur) push(cur);
+      }
+    }
   }
-  return chunks;
+  flush();
+  return out;
 }
 
-async function embedBatch(texts: string[]): Promise<number[][]> {
-  const nonEmpty = texts.map(t => t || " ");
-  // prefer Together for embeddings if API key present; else Ollama
-  if (CFG.TOGETHER_API_KEY) {
-    return await togetherEmbed(nonEmpty);
+/**
+ * Ingest a raw text blob:
+ * - creates a 'documents' row
+ * - chunks text and (optionally) embeds
+ * - inserts rows into 'doc_chunks'
+ *
+ * NOTE: 'params' is optional (so calls with 3 args compile).
+ */
+export async function ingestTextDocument(
+  userId: string,
+  text: string,
+  filename?: string,
+  params?: { doEmbed?: boolean; embeddingModelId?: string }
+) {
+  if (!text || text.trim().length < 10) {
+    throw new Error("Provide 'text' with at least 10 characters.");
   }
-  return await ollamaEmbed(nonEmpty);
-}
 
-/** Ingest arbitrary text into doc + chunks for a user */
-export async function ingestTextDocument(params: {
-  userId: string;
-  filename: string;
-  text: string;
-}) {
-  const { userId, filename, text } = params;
-  const { data: doc, error: de } = await admin
+  const fname = filename && filename.trim() ? filename.trim() : `text-${new Date().toISOString()}.txt`;
+
+  // 1) create document
+  const { data: doc, error: docErr } = await admin
     .from("documents")
-    .insert({ user_id: userId, filename, mime_type: "text/plain", byte_size: text.length })
+    .insert({
+      user_id: userId,
+      filename: fname,
+      mime_type: "text/plain",
+      byte_size: text.length,
+    })
     .select()
     .single();
-  if (de || !doc) throw new Error(de?.message ?? "doc insert failed");
 
+  if (docErr || !doc) throw new Error(docErr?.message ?? "Failed to create document");
+
+  // 2) chunk
   const pieces = chunkText(text);
-  const embs = await embedBatch(pieces);
+  if (pieces.length === 0) throw new Error("No chunks produced from provided text.");
 
+  // 3) embeddings (optional)
+  let embeddings: number[][] | null = null;
+  const wantEmbed = params?.doEmbed ?? Boolean(process.env.TOGETHER_API_KEY);
+  if (wantEmbed) {
+    try {
+      embeddings = await togetherEmbed(pieces, { modelId: params?.embeddingModelId });
+    } catch (e: any) {
+      // Don't fail ingestion if embeddings fail — proceed with null embeddings
+      console.warn("[rag] embedding failed:", e?.message ?? e);
+      embeddings = null;
+    }
+  }
+
+  // 4) insert chunks
   const rows = pieces.map((content, idx) => ({
     document_id: doc.id,
     user_id: userId,
     chunk_index: idx,
     content,
-    embedding: embs[idx] as any, // pgvector will accept float[] via supabase-js
+    embedding: embeddings ? embeddings[idx] : null,
   }));
+  const { error: chErr } = await admin.from("doc_chunks").insert(rows);
+  if (chErr) throw new Error(chErr.message);
 
-  const { error: ce } = await admin.from("doc_chunks").insert(rows);
-  if (ce) throw new Error(ce.message);
-  return { documentId: doc.id, chunks: rows.length };
-}
-
-/** Retrieve top-k context for a user + query */
-export async function retrieveContext(userId: string, query: string, k = 6): Promise<string> {
-  const [qEmb] = await embedBatch([query]);
-  // Use pgvector cosine distance on user's rows
-  const { data, error } = await admin.rpc("match_doc_chunks", {
-    query_embedding: qEmb as any,
-    match_count: k,
-    user_id_input: userId,
-  });
-
-  if (error) {
-    // Fallback: no context
-    return "";
-  }
-  const texts: string[] = (data ?? []).map((r: any) => r.content);
-  return texts.join("\n---\n");
+  return { documentId: doc.id, filename: doc.filename, chunks: pieces.length, embedded: Boolean(embeddings) };
 }

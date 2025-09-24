@@ -1,34 +1,34 @@
-import { CFG } from "./config.js";
+import { getModelId } from "./models/modelCatalog.js";
 
-const MOD_MODEL = process.env.MODERATION_MODEL_ID ?? "meta-llama/Llama-Guard-4-12B"; // adjust anytime
+export const SAFE_REPLY =
+  "I can’t help with that. If you want, I can provide a safer alternative or general information.";
 
-type Verdict = "allow" | "block";
-export async function moderateTextOrAllow(text: string): Promise<Verdict> {
+const BASE_URL = process.env.TOGETHER_BASE_URL || "https://api.together.xyz/v1";
+const API_KEY  = process.env.TOGETHER_API_KEY || "";
+
+export async function moderateTextOrAllow(text: string): Promise<boolean> {
   try {
-    if (!CFG.TOGETHER_API_KEY) return "allow"; // skip if no cloud
-    const res = await fetch(`${CFG.TOGETHER_BASE_URL}/v1/chat/completions`, {
+    const model = getModelId("guard_text");
+    const res = await fetch(`${BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${CFG.TOGETHER_API_KEY}`,
+        "Authorization": `Bearer ${API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: MOD_MODEL,
+        model,
         messages: [
-          { role: "system", content: "Classify the following user message as ALLOW or BLOCK for safety/compliance. Reply with exactly one word: ALLOW or BLOCK." },
-          { role: "user", content: text.slice(0, 8000) },
+          { role: "system", content: "You are a safety classifier. Reply with 'ALLOW' or 'BLOCK' only." },
+          { role: "user", content: text }
         ],
-        temperature: 0,
+        temperature: 0.0,
       }),
     });
-    if (!res.ok) return "allow";
-    const data = await res.json();
-    const out = String(data?.choices?.[0]?.message?.content ?? "").trim().toUpperCase();
-    return out.startsWith("BLOCK") ? "block" : "allow";
+    if (!res.ok) return true; // fail-open (never blocks by network issues)
+    const json = await res.json();
+    const decision = (json?.choices?.[0]?.message?.content ?? "").trim().toUpperCase();
+    return decision.startsWith("ALLOW");
   } catch {
-    return "allow";
+    return true; // fail-open
   }
 }
-
-export const SAFE_REPLY =
-  "I can’t help with that request, but I’m happy to help with a safer alternative or general information.";
