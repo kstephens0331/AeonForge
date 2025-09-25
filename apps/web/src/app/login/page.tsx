@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { apiFetch } from "@/lib/api";
-import { saveToken } from "@/lib/auth.js";
+import { saveToken } from "@/lib/auth";
 
 export default function LoginPage() {
   const router = useRouter();
