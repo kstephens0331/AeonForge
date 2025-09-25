@@ -32,8 +32,19 @@ const ENV_MAP: Partial<Record<ModelAlias, string>> = {
   multilingual: process.env.TOGETHER_MODEL_MULTILINGUAL ?? "",
 };
 
+/**
+ * Resolve an alias to its concrete Together model ID.
+ */
 export function resolveModelId(alias: ModelAlias): string {
   const fromEnv = ENV_MAP[alias];
   if (fromEnv && fromEnv.trim()) return fromEnv.trim();
   return DEFAULTS[alias];
+}
+
+/**
+ * Shim to support legacy imports: moderation.ts calls getModelId().
+ * Simply forwards to resolveModelId.
+ */
+export function getModelId(alias: ModelAlias): string {
+  return resolveModelId(alias);
 }
