@@ -32,23 +32,26 @@ export default function LoginPage() {
       });
       setPhase("verify");
       setStatus("Check your email for the 6-digit code.");
-    } catch (e: any) {
-      setStatus(`Failed to send code: ${e.message || e}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(`Failed to send code: ${msg}`);
     }
   }
 
   async function verifyCode() {
     setStatus("Verifying…");
     try {
-      const { token } = await apiFetch<{ token: string }>("/auth/email/verify", null, {
+      const data = await apiFetch<{ token: string }>("/auth/email/verify", null, {
         method: "POST",
         body: JSON.stringify({ email, code }),
       });
+      const token = data?.token;
       if (!token) throw new Error("No token returned");
       saveToken(token);
       router.replace("/");
-    } catch (e: any) {
-      setStatus(`Invalid code: ${e.message || e}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(`Invalid code: ${msg}`);
     }
   }
 
