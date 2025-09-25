@@ -122,28 +122,6 @@ export default function ChatPage() {
     return null;
   }
 
-  async function fallbackNonStreaming(q: string, targetWords?: number | null) {
-    if (!token) return;
-    try {
-      const r = await apiFetch<{ conversationId: string; text: string }>(
-        "/chat",
-        token,
-        { method: "POST", body: JSON.stringify({ conversationId, text: q, targetWords }) }
-      );
-      if (!conversationId && r.conversationId) {
-        setConversationId(r.conversationId);
-        localStorage.setItem("af_conversation_id", r.conversationId);
-      }
-      const cleaned = (r.text || "(no response)").replace(/<think>[\s\S]*?<\/think>/g, "");
-      pushAssistantIfNeeded();
-      appendAssistant(cleaned);
-    } catch (e) {
-      console.error(e);
-      pushAssistantIfNeeded();
-      appendAssistant("…request failed.");
-    }
-  }
-
   async function sendMessage() {
     const text = input.trim();
     if (!text || !token || loading) return;
@@ -317,7 +295,7 @@ export default function ChatPage() {
             <select
               className="w-full rounded-xl border px-2 py-1"
               value={newMode}
-              onChange={(e) => setNewMode(e.target.value as any)}
+              onChange={(e) => setNewMode((e.target as HTMLSelectElement).value as Conversation["mode"])}
             >
               <option value="code">Code</option>
               <option value="studying">Studying</option>
