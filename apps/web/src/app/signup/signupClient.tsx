@@ -1,43 +1,28 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "../../lib/supabaseClient";   // ⬅️ use your export
-import { saveToken } from "../../lib/auth";
+import { useState } from "react";
+import { supabase } from "../../lib/supabaseClient";  // ⬅️ use your export
 
-export default function LoginClient() {
+export default function SignupClient() {
   const router = useRouter();
-
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string>("");
 
-  useEffect(() => {
-    (async () => {
-      const { data } = await supabase.auth.getSession();
-      const token = data?.session?.access_token;
-      if (token) {
-        saveToken(token);
-        router.replace("/");
-      }
-    })();
-  }, [router]);
-
-  async function signIn() {
-    setStatus("Signing in…");
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  async function signUp() {
+    setStatus("Creating account…");
+    const { error } = await supabase.auth.signUp({ email, password });
     if (error) { setStatus(error.message); return; }
-    const token = data.session?.access_token;
-    if (!token) { setStatus("No session token returned"); return; }
-    saveToken(token);
-    router.replace("/");
+    setStatus("Account created. Please sign in.");
+    router.replace("/login");
   }
 
   return (
     <main className="min-h-screen grid place-items-center p-6">
       <div className="w-full max-w-md rounded-2xl border bg-white p-6 shadow-sm">
-        <h1 className="text-xl font-semibold mb-1">Sign in</h1>
-        <p className="text-sm text-gray-600 mb-4">Use your email and password.</p>
+        <h1 className="text-xl font-semibold mb-1">Create account</h1>
+        <p className="text-sm text-gray-600 mb-4">Enter your email and a strong password.</p>
 
         <label className="block text-sm mb-1">Email</label>
         <input
@@ -58,8 +43,8 @@ export default function LoginClient() {
         />
 
         <div className="flex items-center gap-3">
-          <button onClick={signIn} className="rounded-xl border px-4 py-2">Sign in</button>
-          <a href="/signup" className="text-sm text-blue-600 hover:underline">Create account</a>
+          <button onClick={signUp} className="rounded-xl border px-4 py-2">Sign up</button>
+          <a href="/login" className="text-sm text-blue-600 hover:underline">Back to sign in</a>
         </div>
 
         {status && <div className="mt-3 text-sm text-gray-600">{status}</div>}
