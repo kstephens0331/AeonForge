@@ -1,9 +1,11 @@
-﻿"use client";
+﻿// apps/web/src/app/page.tsx
+"use client";
 
 import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { apiFetch } from "@/lib/api";
 import { Plus } from "lucide-react";
+// ✅ use the correct relative path from src/app → src/lib
+import { apiFetch } from "../lib/api";
 
 type Role = "user" | "assistant";
 type ChatMessage = { role: Role; content: string };
@@ -16,8 +18,9 @@ type Conversation = {
   mode?: "code" | "studying" | "project" | "general";
 };
 
-function useAuthToken() {
-  const [token, setToken] = useState<string | null>(null);
+// ✅ Always return a string (empty when not signed in) to avoid string|null TS errors
+function useAuthToken(): string {
+  const [token, setToken] = useState<string>("");
   useEffect(() => {
     const t = typeof window !== "undefined" ? localStorage.getItem("af_token") : null;
     setToken(t || "");
@@ -170,35 +173,35 @@ export default function ChatPage() {
           const block = buffer.slice(0, sep);
           buffer = buffer.slice(sep + 2);
 
-          let event: string | null = null;
-          const datas: string[] = [];
+        let event: string | null = null;
+        const datas: string[] = [];
 
-          for (const raw of block.split("\n")) {
-            if (!raw) continue;
-            if (raw.startsWith(":")) continue;
-            if (raw.startsWith("event:")) { event = raw.slice(6).trim(); continue; }
-            if (raw.startsWith("data:")) { datas.push(raw.slice(5)); continue; }
-          }
+        for (const raw of block.split("\n")) {
+          if (!raw) continue;
+          if (raw.startsWith(":")) continue;
+          if (raw.startsWith("event:")) { event = raw.slice(6).trim(); continue; }
+          if (raw.startsWith("data:")) { datas.push(raw.slice(5)); continue; }
+        }
 
-          const dataJoined = datas.join("\n");
-          if (event === "status") {
-            setMiniStatus(dataJoined.trim());
-            continue;
-          }
+        const dataJoined = datas.join("\n");
+        if (event === "status") {
+          setMiniStatus(dataJoined.trim());
+          continue;
+        }
 
-          if (dataJoined) {
-            if (!gotFirstData) pushAssistantIfNeeded();
-            const cleaned = dataJoined.replace(/<think>[\s\S]*?<\/think>/g, "");
-            if (cleaned) {
-              appendAssistant(cleaned);
-              gotFirstData = true;
-              advanced = true;
-              setMiniStatus("generating");
-            }
+        if (dataJoined) {
+          if (!gotFirstData) pushAssistantIfNeeded();
+          const cleaned = dataJoined.replace(/<think>[\s\S]*?<\/think>/g, "");
+          if (cleaned) {
+            appendAssistant(cleaned);
+            gotFirstData = true;
+            advanced = true;
+            setMiniStatus("generating");
           }
         }
-        return advanced;
       }
+      return advanced;
+    }
 
       for (;;) {
         const { value, done } = await reader.read();
@@ -278,11 +281,11 @@ export default function ChatPage() {
     <main className="h-screen w-screen">
       <div className="grid grid-cols-[18rem_1fr] h-full">
         {/* Sidebar */}
-        <aside className="h-full border-r overflow-hidden flex flex-col">
+        <aside className="h-full border-r border-white/10 overflow-hidden flex flex-col bg-white/5 backdrop-blur-xl">
           <div className="px-3 py-2 flex items-center justify-between">
-            <span className="text-xs uppercase text-gray-500">Conversations</span>
+            <span className="text-xs uppercase text-slate-400">Conversations</span>
             <button
-              className="rounded-xl border px-2 py-1 text-sm"
+              className="rounded-xl border border-white/10 bg-white/10 px-2 py-1 text-sm text-slate-100 hover:bg-white/20 transition"
               onClick={startNewChat}
               title="Create new chat"
             >
@@ -291,9 +294,9 @@ export default function ChatPage() {
           </div>
 
           <div className="px-3 py-2">
-            <label className="text-xs uppercase text-gray-500 block mb-1">New chat mode</label>
+            <label className="text-xs uppercase text-slate-400 block mb-1">New chat mode</label>
             <select
-              className="w-full rounded-xl border px-2 py-1"
+              className="w-full rounded-xl border border-white/10 bg-white/10 text-slate-100 px-2 py-1 outline-none focus:ring-2 focus:ring-sky-300/40"
               value={newMode}
               onChange={(e) => setNewMode((e.target as HTMLSelectElement).value as Conversation["mode"])}
             >
@@ -309,36 +312,53 @@ export default function ChatPage() {
               <button
                 key={c.id}
                 onClick={() => switchConversation(c.id)}
-                className={`w-full text-left truncate rounded-xl px-2 py-1 hover:bg-gray-100 ${conversationId === c.id ? "bg-gray-100" : ""}`}
+                className={`w-full text-left truncate rounded-xl px-2 py-1
+                  ${conversationId === c.id ? "bg-white/10 text-slate-100 border border-white/10" : "text-slate-200 hover:bg-white/5"}
+                `}
               >
                 <div className="text-sm">{c.title || "(untitled)"}</div>
-                <div className="text-xs text-gray-500">{c.mode ? `[${c.mode}]` : ""}</div>
+                <div className="text-xs text-slate-400">{c.mode ? `[${c.mode}]` : ""}</div>
               </button>
             ))}
             {convos.length === 0 && (
-              <div className="text-xs text-gray-500 px-2 py-2">No conversations yet.</div>
+              <div className="text-xs text-slate-400 px-2 py-2">No conversations yet.</div>
             )}
           </div>
         </aside>
 
         {/* Chat window */}
         <section className="h-full flex flex-col">
-          <div className="border-b px-4 py-2 text-sm text-gray-600">
+          <div className="border-b border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-300">
             {miniStatus ? `Status: ${miniStatus}` : ""}
           </div>
 
-          <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-3">
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-3 chat-scroll">
             {messages.map((m, i) => (
               <div key={i} className={`max-w-3xl ${m.role === "user" ? "ml-auto text-right" : ""}`}>
-                <div className={`inline-block rounded-2xl border px-4 py-2 ${m.role === "user" ? "bg-white" : "bg-gray-50"}`}>
-                  <div className="text-xs text-gray-500 mb-1">{m.role}</div>
-                  <div className="whitespace-pre-wrap text-sm">{m.content}</div>
+                {/* ✅ High-contrast bubbles for dark theme */}
+                <div
+                  className={`inline-block rounded-2xl px-4 py-3 shadow-sm ${
+                    m.role === "user"
+                      ? "bg-gradient-to-br from-slate-800 to-slate-900 text-white border border-slate-700"
+                      : "bg-white/95 text-slate-900 border border-slate-200"
+                  }`}
+                >
+                  <div
+                    className={`mb-1 text-xs ${
+                      m.role === "user" ? "text-slate-300" : "text-sky-600"
+                    }`}
+                  >
+                    {m.role === "user" ? "You" : "AeonForge"}
+                  </div>
+                  <div className="whitespace-pre-wrap text-sm leading-relaxed">
+                    {m.content}
+                  </div>
                 </div>
               </div>
             ))}
           </div>
 
-          <div className="border-t p-3 flex gap-2">
+          <div className="border-t border-white/10 bg-white/5 p-3 flex gap-2">
             <textarea
               ref={textareaRef}
               value={input}
@@ -351,12 +371,12 @@ export default function ChatPage() {
                 }
               }}
               placeholder="Type your message… (e.g., 'write 1.2k words on …')"
-              className="flex-1 rounded-2xl border px-4 py-3 resize-none leading-6"
+              className="flex-1 rounded-2xl border border-white/10 bg-white/10 text-slate-100 px-4 py-3 resize-none leading-6 outline-none focus:ring-2 focus:ring-sky-300/40"
               rows={1}
             />
             <button
               onClick={loading ? stopRequest : sendMessage}
-              className="rounded-2xl border px-4 py-3 min-w-24"
+              className="rounded-2xl border border-white/10 bg-white/10 text-slate-100 px-4 py-3 min-w-24 hover:bg-white/20 transition"
             >
               {loading ? "Stop" : "Send"}
             </button>
@@ -365,11 +385,14 @@ export default function ChatPage() {
       </div>
 
       {!token && (
-        <div className="absolute inset-0 bg-white/70 backdrop-blur-sm flex items-center justify-center">
+        <div className="absolute inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center">
           <div className="text-center space-y-4">
-            <h1 className="text-2xl font-semibold">AeonForge</h1>
-            <p className="text-slate-600">Please sign in to continue.</p>
-            <Link href="/login" className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition">
+            <h1 className="text-2xl font-semibold text-white">AeonForge</h1>
+            <p className="text-slate-300">Please sign in to continue.</p>
+            <Link
+              href="/login"
+              className="inline-block rounded-xl bg-sky-300 text-slate-900 px-4 py-2 hover:bg-sky-200 transition"
+            >
               Sign in
             </Link>
           </div>
