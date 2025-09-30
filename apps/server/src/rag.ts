@@ -94,3 +94,94 @@ export async function ingestTextDocument(
 
   return { documentId: doc.id, filename: doc.filename, chunks: pieces.length, embedded: Boolean(embeddings) };
 }
+
+/**
+ * Retrieve relevant context chunks for a query using semantic search.
+ * Returns top-k most relevant chunks from user's documents.
+ */
+export async function retrieveContext(
+  userId: string,
+  query: string,
+  opts?: { topK?: number; embeddingModelId?: string; useKeywordFallback?: boolean }
+): Promise<Array<{ content: string; filename: string; similarity: number }>> {
+  const topK = opts?.topK ?? 5;
+
+  try {
+    // 1) Embed the query
+    const [queryEmbedding] = await togetherEmbed([query], { modelId: opts?.embeddingModelId });
+
+    if (!queryEmbedding || queryEmbedding.length === 0) {
+      throw new Error("Failed to embed query");
+    }
+
+    // 2) Use Supabase pgvector similarity search
+    // Note: Requires pgvector extension and proper indexing in Supabase
+    const { data, error } = await admin.rpc("match_doc_chunks", {
+      query_embedding: queryEmbedding,
+      match_user_id: userId,
+      match_count: topK,
+      similarity_threshold: 0.5, // Adjust based on your needs
+    });
+
+    if (error) {
+      console.warn("[rag] Semantic search failed:", error.message);
+      // Fallback to keyword search if enabled
+      if (opts?.useKeywordFallback) {
+        return await keywordSearch(userId, query, topK);
+      }
+      return [];
+    }
+
+    return (data ?? []).map((row: any) => ({
+      content: row.content,
+      filename: row.filename,
+      similarity: row.similarity,
+    }));
+  } catch (e: any) {
+    console.warn("[rag] retrieveContext failed:", e?.message ?? e);
+    // Fallback to keyword search
+    if (opts?.useKeywordFallback) {
+      return await keywordSearch(userId, query, topK);
+    }
+    return [];
+  }
+}
+
+/**
+ * Keyword-based fallback search when embeddings are unavailable.
+ */
+async function keywordSearch(
+  userId: string,
+  query: string,
+  limit: number
+): Promise<Array<{ content: string; filename: string; similarity: number }>> {
+  try {
+    // Simple full-text search using ILIKE
+    const keywords = query.toLowerCase().split(/\s+/).filter(k => k.length > 2).slice(0, 5);
+    if (keywords.length === 0) return [];
+
+    const { data, error } = await admin
+      .from("doc_chunks")
+      .select(`
+        content,
+        documents!inner(filename)
+      `)
+      .eq("user_id", userId)
+      .ilike("content", `%${keywords[0]}%`)
+      .limit(limit);
+
+    if (error) {
+      console.warn("[rag] Keyword search failed:", error.message);
+      return [];
+    }
+
+    return (data ?? []).map((row: any) => ({
+      content: row.content,
+      filename: row.documents?.filename ?? "unknown",
+      similarity: 0.7, // Mock similarity for keyword matches
+    }));
+  } catch (e: any) {
+    console.warn("[rag] keywordSearch failed:", e?.message ?? e);
+    return [];
+  }
+}

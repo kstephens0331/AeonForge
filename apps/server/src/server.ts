@@ -1,5 +1,6 @@
 ﻿import Fastify from "fastify";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 
 // Auth / DB
 import { verifySupabaseJwt } from "./auth.js";
@@ -13,8 +14,26 @@ import { routeGenerateWithHistory, routeGenerateStreamWithMeta } from "./router.
 import { moderateTextOrAllow, SAFE_REPLY } from "./moderation.js";
 import { estimateTokensFromText, costFromTokens, getTogetherPricePerToken } from "./cost.js";
 
-// Optional RAG text ingest (kept)
-import { ingestTextDocument } from "./rag.js";
+// RAG text ingest + retrieval
+import { ingestTextDocument, retrieveContext } from "./rag.js";
+
+// Vision/multimodal
+import { analyzeImage, bufferToDataUri } from "./models/vision.js";
+
+// File processing
+import { processFile } from "./fileProcessors.js";
+
+// Search
+import { unifiedSearch, searchConversations, searchMessages } from "./search.js";
+
+// Rate limiting
+import { checkRateLimit, getQuotaUsage } from "./rateLimit.js";
+
+// Export
+import { exportMarkdown, exportJSON, exportText, exportHTML } from "./export.js";
+
+// Enhanced system prompts
+import { getSystemPrompt, enhanceCustomPrompt } from "./systemPrompts.js";
 
 const fastify = Fastify({ logger: true });
 
@@ -23,6 +42,13 @@ fastify.register(cors, {
   origin: "http://localhost:3000",
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
+});
+
+/* Multipart support for file uploads */
+fastify.register(multipart, {
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB max file size
+  },
 });
 
 /* Health */
@@ -45,16 +71,72 @@ fastify.addHook("preHandler", async (req, reply) => {
   }
 });
 
+/* Rate limiting hook for chat endpoints */
+fastify.addHook("preHandler", async (req, reply) => {
+  const chatEndpoints = ["/chat", "/chat/stream"];
+  if (!chatEndpoints.includes(req.routerPath)) return;
+
+  const userId = (req as any).user?.sub as string;
+  if (!userId) return; // Auth hook will catch this
+
+  const rateCheck = await checkRateLimit(userId);
+  if (!rateCheck.allowed) {
+    reply.code(429).headers({
+      "Retry-After": rateCheck.retryAfter?.toString() ?? "3600",
+    });
+    reply.send({ error: rateCheck.reason ?? "Rate limit exceeded" });
+  }
+});
+
 /* ---------------- Conversations ---------------- */
 
-fastify.post<{ Body: { title?: string | null } }>("/conversations", async (req, reply) => {
+fastify.post<{ Body: { title?: string | null; system_prompt?: string | null } }>("/conversations", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
-  const { title = null } = req.body ?? {};
+  const { title = null, system_prompt = null } = req.body ?? {};
   const { data, error } = await admin
     .from("conversations")
-    .insert({ user_id: userId, title })
+    .insert({ user_id: userId, title, system_prompt })
     .select()
     .single();
+  if (error) return reply.code(500).send({ error: error.message });
+  return { conversation: data as ConversationRow };
+});
+
+/* Update conversation (title or system prompt) */
+fastify.patch<{
+  Params: { id: string };
+  Body: { title?: string | null; system_prompt?: string | null };
+}>("/conversations/:id", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+  const convoId = req.params.id;
+  const { title, system_prompt } = req.body ?? {};
+
+  // Verify ownership
+  const { data: convo, error: convoErr } = await admin
+    .from("conversations")
+    .select("id,user_id")
+    .eq("id", convoId)
+    .single();
+
+  if (convoErr || !convo || convo.user_id !== userId) {
+    return reply.code(404).send({ error: "Conversation not found" });
+  }
+
+  const updates: any = {};
+  if (title !== undefined) updates.title = title;
+  if (system_prompt !== undefined) updates.system_prompt = system_prompt;
+
+  if (Object.keys(updates).length === 0) {
+    return reply.code(400).send({ error: "No fields to update" });
+  }
+
+  const { data, error } = await admin
+    .from("conversations")
+    .update(updates)
+    .eq("id", convoId)
+    .select()
+    .single();
+
   if (error) return reply.code(500).send({ error: error.message });
   return { conversation: data as ConversationRow };
 });
@@ -120,6 +202,256 @@ fastify.post<{
   return { message: data as MessageRow };
 });
 
+/* Edit message */
+fastify.patch<{
+  Params: { conversationId: string; messageId: string };
+  Body: { content: string };
+}>("/conversations/:conversationId/messages/:messageId", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+  const { conversationId, messageId } = req.params;
+  const { content } = req.body;
+
+  if (!content || content.trim().length === 0) {
+    return reply.code(400).send({ error: "Content cannot be empty" });
+  }
+
+  // Verify conversation ownership
+  const { data: convo, error: convoErr } = await admin
+    .from("conversations")
+    .select("id,user_id")
+    .eq("id", conversationId)
+    .single();
+
+  if (convoErr || !convo || convo.user_id !== userId) {
+    return reply.code(404).send({ error: "Conversation not found" });
+  }
+
+  // Update message
+  const { data, error } = await admin
+    .from("messages")
+    .update({ content })
+    .eq("id", messageId)
+    .eq("conversation_id", conversationId)
+    .select()
+    .single();
+
+  if (error) return reply.code(500).send({ error: error.message });
+  if (!data) return reply.code(404).send({ error: "Message not found" });
+
+  return { message: data as MessageRow };
+});
+
+/* Delete message */
+fastify.delete<{ Params: { conversationId: string; messageId: string } }>(
+  "/conversations/:conversationId/messages/:messageId",
+  async (req, reply) => {
+    const userId = (req as any).user?.sub as string;
+    const { conversationId, messageId } = req.params;
+
+    // Verify conversation ownership
+    const { data: convo, error: convoErr } = await admin
+      .from("conversations")
+      .select("id,user_id")
+      .eq("id", conversationId)
+      .single();
+
+    if (convoErr || !convo || convo.user_id !== userId) {
+      return reply.code(404).send({ error: "Conversation not found" });
+    }
+
+    // Delete message
+    const { error } = await admin
+      .from("messages")
+      .delete()
+      .eq("id", messageId)
+      .eq("conversation_id", conversationId);
+
+    if (error) return reply.code(500).send({ error: error.message });
+
+    return { success: true };
+  }
+);
+
+/* Regenerate assistant response */
+fastify.post<{
+  Params: { conversationId: string; messageId: string };
+  Body: { targetWords?: number | null; mode?: "coding" | "general" };
+}>("/conversations/:conversationId/messages/:messageId/regenerate", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+  const { conversationId, messageId } = req.params;
+  const { targetWords, mode } = req.body ?? {};
+
+  // Verify conversation ownership
+  const { data: convo, error: convoErr } = await admin
+    .from("conversations")
+    .select("id,user_id")
+    .eq("id", conversationId)
+    .single();
+
+  if (convoErr || !convo || convo.user_id !== userId) {
+    return reply.code(404).send({ error: "Conversation not found" });
+  }
+
+  // Get the message to regenerate (must be assistant message)
+  const { data: msg, error: msgErr } = await admin
+    .from("messages")
+    .select("id,role,created_at")
+    .eq("id", messageId)
+    .eq("conversation_id", conversationId)
+    .single();
+
+  if (msgErr || !msg) {
+    return reply.code(404).send({ error: "Message not found" });
+  }
+
+  if (msg.role !== "assistant") {
+    return reply.code(400).send({ error: "Can only regenerate assistant messages" });
+  }
+
+  // Get history up to the message before this one
+  const { data: rows } = await admin
+    .from("messages")
+    .select("role,content,created_at")
+    .eq("conversation_id", conversationId)
+    .lt("created_at", msg.created_at)
+    .order("created_at", { ascending: true });
+
+  const history: ChatMessage[] = (rows ?? []).map(r => ({ role: r.role as Role, content: r.content }));
+
+  // Get the user message (last message in history)
+  if (history.length === 0 || history[history.length - 1].role !== "user") {
+    return reply.code(400).send({ error: "Cannot regenerate: no user message found" });
+  }
+
+  const userText = history[history.length - 1].content;
+
+  // Retrieve RAG context
+  let ragContext = "";
+  try {
+    const chunks = await retrieveContext(userId, userText, { topK: 3, useKeywordFallback: true });
+    if (chunks.length > 0) {
+      ragContext = "\n\nRelevant context from your documents:\n" +
+        chunks.map((c, i) => `[${i + 1}] From "${c.filename}":\n${c.content}`).join("\n\n");
+    }
+  } catch (e: any) {
+    console.warn("[regenerate] RAG retrieval failed:", e?.message ?? e);
+  }
+
+  // Use enhanced system prompt
+  const system = `${getSystemPrompt("default")}${ragContext}`;
+
+  // Generate new response
+  const t0 = Date.now();
+  const r = await routeGenerateWithHistory(
+    system,
+    history.slice(0, -1), // exclude the user message we're responding to
+    userText,
+    { targetWords: targetWords ?? undefined, mode: mode ?? undefined }
+  );
+  const resultText = r.text;
+
+  // Update the message with new content
+  const { data: updated, error: updateErr } = await admin
+    .from("messages")
+    .update({ content: resultText })
+    .eq("id", messageId)
+    .select()
+    .single();
+
+  if (updateErr) return reply.code(500).send({ error: updateErr.message });
+
+  return { message: updated as MessageRow, regenerated: true };
+});
+
+/* ---------------- Search ---------------- */
+fastify.get<{ Querystring: { q: string } }>("/search", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+  const query = req.query?.q ?? "";
+
+  if (!query || query.trim().length < 2) {
+    return reply.code(400).send({ error: "Query must be at least 2 characters" });
+  }
+
+  try {
+    const results = await unifiedSearch(userId, query.trim());
+    return results;
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message ?? "Search failed" });
+  }
+});
+
+/* ---------------- Quota Usage ---------------- */
+fastify.get("/quota", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+
+  try {
+    const usage = await getQuotaUsage(userId);
+    return usage;
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message ?? "Failed to get quota" });
+  }
+});
+
+/* ---------------- Export Conversations ---------------- */
+fastify.get<{ Params: { id: string }; Querystring: { format?: string } }>(
+  "/conversations/:id/export",
+  async (req, reply) => {
+    const userId = (req as any).user?.sub as string;
+    const convoId = req.params.id;
+    const format = (req.query?.format ?? "markdown").toLowerCase();
+
+    // Verify ownership
+    const { data: convo, error: convoErr } = await admin
+      .from("conversations")
+      .select("id,user_id")
+      .eq("id", convoId)
+      .single();
+
+    if (convoErr || !convo || convo.user_id !== userId) {
+      return reply.code(404).send({ error: "Conversation not found" });
+    }
+
+    try {
+      let content: string;
+      let mimeType: string;
+      let filename: string;
+
+      switch (format) {
+        case "json":
+          content = await exportJSON(convoId);
+          mimeType = "application/json";
+          filename = `conversation-${convoId}.json`;
+          break;
+        case "text":
+        case "txt":
+          content = await exportText(convoId);
+          mimeType = "text/plain";
+          filename = `conversation-${convoId}.txt`;
+          break;
+        case "html":
+          content = await exportHTML(convoId);
+          mimeType = "text/html";
+          filename = `conversation-${convoId}.html`;
+          break;
+        case "markdown":
+        case "md":
+        default:
+          content = await exportMarkdown(convoId);
+          mimeType = "text/markdown";
+          filename = `conversation-${convoId}.md`;
+          break;
+      }
+
+      reply
+        .header("Content-Type", mimeType)
+        .header("Content-Disposition", `attachment; filename="${filename}"`)
+        .send(content);
+    } catch (e: any) {
+      return reply.code(500).send({ error: e?.message ?? "Export failed" });
+    }
+  }
+);
+
 /* ---------------- RAG Ingest (text) ---------------- */
 fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest", async (req, reply) => {
   const userId = (req as any).user?.sub as string;
@@ -132,6 +464,79 @@ fastify.post<{ Body: { text: string; filename?: string | null } }>("/rag/ingest"
     return result;
   } catch (e: any) {
     return reply.code(500).send({ error: e?.message ?? "Ingest failed" });
+  }
+});
+
+/* ---------------- Image Analysis ---------------- */
+fastify.post("/analyze/image", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+
+  try {
+    const data = await req.file();
+    if (!data) {
+      return reply.code(400).send({ error: "No image file provided" });
+    }
+
+    // Get buffer from stream
+    const buffer = await data.toBuffer();
+    const mimeType = data.mimetype;
+
+    // Validate image type
+    if (!mimeType.startsWith("image/")) {
+      return reply.code(400).send({ error: "File must be an image" });
+    }
+
+    // Get prompt from fields
+    const fields: any = data.fields;
+    const prompt = fields?.prompt?.value ?? "Describe this image in detail.";
+
+    // Convert to data URI
+    const dataUri = bufferToDataUri(buffer, mimeType);
+
+    // Analyze image
+    const result = await analyzeImage(dataUri, prompt);
+
+    if (!result.success) {
+      return reply.code(500).send({ error: result.error ?? "Image analysis failed" });
+    }
+
+    return { analysis: result.text };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message ?? "Image upload failed" });
+  }
+});
+
+/* ---------------- File Upload & RAG Ingest ---------------- */
+fastify.post("/upload/file", async (req, reply) => {
+  const userId = (req as any).user?.sub as string;
+
+  try {
+    const data = await req.file();
+    if (!data) {
+      return reply.code(400).send({ error: "No file provided" });
+    }
+
+    const buffer = await data.toBuffer();
+    const filename = data.filename;
+    const mimeType = data.mimetype;
+
+    // Process file to extract text
+    const { text, processedAs } = await processFile(buffer, filename, mimeType);
+
+    if (!text || text.trim().length < 10) {
+      return reply.code(400).send({ error: "File contains no readable text" });
+    }
+
+    // Ingest into RAG
+    const result = await ingestTextDocument(userId, text, filename);
+
+    return {
+      ...result,
+      processedAs,
+      textLength: text.length,
+    };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message ?? "File processing failed" });
   }
 });
 
@@ -150,6 +555,8 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
 
     // Ensure conversation
     let convId = conversationId ?? null;
+    let customSystemPrompt: string | null = null;
+
     if (!convId) {
       const { data: newConv, error: convErr } = await admin
         .from("conversations")
@@ -158,9 +565,11 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
         .single();
       if (convErr || !newConv) return reply.code(500).send({ error: convErr?.message ?? "conv create failed" });
       convId = newConv.id;
+      customSystemPrompt = newConv.system_prompt;
     } else {
-      const { data: c, error: ce } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
+      const { data: c, error: ce } = await admin.from("conversations").select("id,user_id,system_prompt").eq("id", convId).single();
       if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
+      customSystemPrompt = c.system_prompt;
     }
 
     // Safety moderation
@@ -182,7 +591,23 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
       .order("created_at", { ascending: true });
     const history: ChatMessage[] = (rows ?? []).map(r => ({ role: r.role as Role, content: r.content }));
 
-    const system = `You are AeonForge. Be helpful, accurate, and conversational. Maintain dialogue continuity with prior turns.`;
+    // Retrieve relevant context from user's documents (RAG)
+    let ragContext = "";
+    try {
+      const chunks = await retrieveContext(userId, q, { topK: 3, useKeywordFallback: true });
+      if (chunks.length > 0) {
+        ragContext = "\n\nRelevant context from your documents:\n" +
+          chunks.map((c, i) => `[${i + 1}] From "${c.filename}":\n${c.content}`).join("\n\n");
+      }
+    } catch (e: any) {
+      console.warn("[chat] RAG retrieval failed:", e?.message ?? e);
+    }
+
+    // Use enhanced system prompt
+    const baseSystem = customSystemPrompt
+      ? enhanceCustomPrompt(customSystemPrompt)
+      : getSystemPrompt("default");
+    const system = `${baseSystem}${ragContext}`;
 
     const t0 = Date.now();
     const r = await routeGenerateWithHistory(
@@ -241,6 +666,8 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
 
     // Ensure conversation
     let convId = conversationId ?? null;
+    let customSystemPrompt: string | null = null;
+
     if (!convId) {
       const { data: newConv, error: convErr } = await admin
         .from("conversations")
@@ -249,9 +676,11 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
         .single();
       if (convErr || !newConv) return reply.code(500).send({ error: convErr?.message ?? "conv create failed" });
       convId = newConv.id;
+      customSystemPrompt = newConv.system_prompt;
     } else {
-      const { data: c, error: ce } = await admin.from("conversations").select("id,user_id").eq("id", convId).single();
+      const { data: c, error: ce } = await admin.from("conversations").select("id,user_id,system_prompt").eq("id", convId).single();
       if (ce || !c || c.user_id !== userId) return reply.code(404).send({ error: "Conversation not found" });
+      customSystemPrompt = c.system_prompt;
     }
 
     // Safety moderation
@@ -281,6 +710,18 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
       .order("created_at", { ascending: true });
     const history: ChatMessage[] = (rows ?? []).map(r => ({ role: r.role as Role, content: r.content }));
 
+    // Retrieve relevant context from user's documents (RAG)
+    let ragContextStream = "";
+    try {
+      const chunks = await retrieveContext(userId, q, { topK: 3, useKeywordFallback: true });
+      if (chunks.length > 0) {
+        ragContextStream = "\n\nRelevant context from your documents:\n" +
+          chunks.map((c, i) => `[${i + 1}] From "${c.filename}":\n${c.content}`).join("\n\n");
+      }
+    } catch (e: any) {
+      console.warn("[chat/stream] RAG retrieval failed:", e?.message ?? e);
+    }
+
     // Prepare streaming response
     reply.raw.writeHead(200, {
       "Content-Type": "text/plain; charset=utf-8",
@@ -302,8 +743,14 @@ fastify.post<{ Body: { conversationId?: string | null; text: string; targetWords
     let togetherModelId: string | undefined;
 
     try {
+      // Use enhanced system prompt
+      const baseSystemStream = customSystemPrompt
+        ? enhanceCustomPrompt(customSystemPrompt)
+        : getSystemPrompt("default");
+      const systemStream = `${baseSystemStream}${ragContextStream}`;
+
       const { provider: p, modelId, stream } = await routeGenerateStreamWithMeta(
-        `You are AeonForge. Be helpful, accurate, and conversational. Maintain dialogue continuity with prior turns.`,
+        systemStream,
         history.slice(0, -1), // pass prior turns; latest user is "q"
         q,
         aborter.signal,

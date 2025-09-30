@@ -43,6 +43,7 @@ export type ConversationRow = {
   id: string;
   user_id: string;
   title: string | null;
+  system_prompt: string | null;
   created_at: string;
 };
 
