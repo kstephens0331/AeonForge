@@ -1,0 +1,11 @@
+actions:
+  shell:
+    allow:
+      - node
+      - npm
+      - npx
+    deny:
+      - cd
+      - rm
+      - mv
+      - shutdown
